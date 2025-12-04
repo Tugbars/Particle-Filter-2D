@@ -272,7 +272,7 @@ int main(int argc, char *argv[])
     /* Pin to P-cores only on Intel hybrid CPUs (14900KF, 13900K, etc.)
      * This avoids slow E-cores and gives ~25-30% speedup.
      * Must be called BEFORE any MKL/OpenMP operations. */
-    mkl_config_14900kf(verbose_mkl);
+    pf2d_mkl_config_14900kf(verbose_mkl);
 
     printf("\n=== 2D Particle Filter Benchmark ===\n");
     printf("Particles:      %d\n", n_particles);
