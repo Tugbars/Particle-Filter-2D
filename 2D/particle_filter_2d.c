@@ -408,9 +408,9 @@ void pf2d_initialize(PF2D *pf, pf2d_real price0, pf2d_real price_spread,
     }
     else
     {
-        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[0],
+        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[0],
                          n, pf->prices, price0, price_spread);
-        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[0],
+        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[0],
                          n, pf->log_vols, log_vol0, log_vol_spread);
     }
 
@@ -509,9 +509,9 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
 
             if (len > 0)
             {
-                pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+                pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                                  len, &noise1[start], 0.0, 1.0);
-                pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+                pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                                  len, &noise2[start], 0.0, 1.0);
             }
         }
@@ -599,9 +599,9 @@ static void pf2d_propagate_vectorized(PF2D *pf)
 
         if (len > 0)
         {
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              len, &z1[start], 0.0, 1.0);
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              len, &z2[start], 0.0, 1.0);
             pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[tid],
                             len, &u_reg[start], 0.0, 1.0);
@@ -695,9 +695,9 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
         if (len > 0)
         {
             /* Generate RNG for this thread's chunk */
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              len, &z1[start], 0.0, 1.0);
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, pf->mkl_rng[tid],
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              len, &z2[start], 0.0, 1.0);
 
             /* Generate uniform for regime sampling - reuse lw buffer temporarily */
@@ -1336,7 +1336,7 @@ void pf2d_warmup(PF2D *pf)
         int len = (start + chunk > n) ? n - start : chunk;
         if (len > 0 && start < n)
         {
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2,
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF,
                              pf->mkl_rng[tid], len, &pf->scratch1[start], 0.0, 1.0);
             pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD,
                             pf->mkl_rng[tid], len, &pf->scratch2[start], 0.0, 1.0);
