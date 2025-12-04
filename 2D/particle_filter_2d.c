@@ -140,8 +140,9 @@ static void parallel_batch_search(
     int *indices,             /* Output: found indices */
     int n)                    /* Number of particles */
 {
+    int i;
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++)
+    for (i = 0; i < n; i++)
     {
         indices[i] = binary_search_cumsum(cumsum, n, queries[i]);
     }
@@ -157,8 +158,9 @@ static void parallel_stratified_uniform(
     pf2d_real step,
     int n)
 {
+    int i;
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++)
+    for (i = 0; i < n; i++)
     {
         out[i] = u0 + i * step;
     }
@@ -385,9 +387,10 @@ void pf2d_initialize(PF2D *pf, pf2d_real price0, pf2d_real price_spread,
         {
             int tid = omp_get_thread_num();
             pf2d_pcg32_t *rng = &pf->pcg[tid];
+            int i;
 
 #pragma omp for
-            for (int i = 0; i < n; i++)
+            for (i = 0; i < n; i++)
             {
                 pf->prices[i] = price0 + price_spread * pf2d_pcg32_gaussian(rng);
                 pf->log_vols[i] = log_vol0 + log_vol_spread * pf2d_pcg32_gaussian(rng);
@@ -440,9 +443,10 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
         {
             int tid = omp_get_thread_num();
             pf2d_pcg32_t *rng = &pf->pcg[tid];
+            int i;
 
 #pragma omp for
-            for (int i = 0; i < n; i++)
+            for (i = 0; i < n; i++)
             {
                 /* Sample regime - use (SIZE-1) to avoid overflow when u=1.0 */
                 pf2d_real u = pf2d_pcg32_uniform(rng);
@@ -507,8 +511,9 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
         pf2d_real *uniform = pf->log_weights; /* Reuse buffer temporarily */
         pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[0], n, uniform, 0.0, 1.0);
 
+        int i;
 #pragma omp parallel for
-        for (int i = 0; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             /* Sample regime - use (SIZE-1) to avoid overflow when u=1.0 */
             int lut_idx = (int)(uniform[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
@@ -599,10 +604,11 @@ static void pf2d_propagate_vectorized(PF2D *pf)
         }
     }
 
-/* 3. Physics update - now just FMA, no exp() in loop
- *    Modern CPUs can execute 2 FMA per cycle per core. */
+    /* 3. Physics update - now just FMA, no exp() in loop
+     *    Modern CPUs can execute 2 FMA per cycle per core. */
+    int i;
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++)
+    for (i = 0; i < n; i++)
     {
         /* Regime lookup - O(1) via LUT, safe bounds */
         int lut_idx = (int)(u_reg[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
@@ -640,22 +646,33 @@ static void pf2d_update_weights_vectorized(PF2D *pf, pf2d_real observation)
     pf2d_real *restrict w = pf->weights;
 
     /* 1. Fused: compute log-likelihoods AND find max in single pass
-     *    Reduces memory traffic - read prices once, write lw once. */
+     *    Reduces memory traffic - read prices once, write lw once.
+     *    MSVC OpenMP 2.0 doesn't support reduction(max:), use manual. */
     pf2d_real max_lw = (pf2d_real)(-1e30);
+    int i;
 
-#pragma omp parallel for reduction(max : max_lw) schedule(static)
-    for (int i = 0; i < n; i++)
+#pragma omp parallel
     {
-        pf2d_real diff = observation - prices[i];
-        pf2d_real val = nhiv * diff * diff;
-        lw[i] = val;
-        if (val > max_lw)
-            max_lw = val;
+        pf2d_real local_max = (pf2d_real)(-1e30);
+#pragma omp for schedule(static)
+        for (i = 0; i < n; i++)
+        {
+            pf2d_real diff = observation - prices[i];
+            pf2d_real val = nhiv * diff * diff;
+            lw[i] = val;
+            if (val > local_max)
+                local_max = val;
+        }
+#pragma omp critical
+        {
+            if (local_max > max_lw)
+                max_lw = local_max;
+        }
     }
 
 /* 2. Subtract max for numerical stability */
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n; i++)
+    for (i = 0; i < n; i++)
     {
         lw[i] -= max_lw;
     }
@@ -672,7 +689,7 @@ static void pf2d_update_weights_vectorized(PF2D *pf, pf2d_real observation)
         /* All weights underflowed - reset to uniform */
         pf2d_real uw = pf->uniform_weight;
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             w[i] = uw;
         }
@@ -844,9 +861,10 @@ void pf2d_resample(PF2D *pf)
         int *indices = pf->indices;
         parallel_batch_search(cs, search_sites, indices, n);
 
-/* Parallel gather */
+        /* Parallel gather */
+        int i;
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             int idx = indices[i];
             pf->prices_tmp[i] = pf->prices[idx];
@@ -861,7 +879,8 @@ void pf2d_resample(PF2D *pf)
 
         /* Sequential systematic resampling (low overhead for N < 16k) */
         int idx = 0;
-        for (int i = 0; i < n; i++)
+        int i;
+        for (i = 0; i < n; i++)
         {
             pf2d_real u = u0 + i * inv_n;
             while (cs[idx] < u && idx < n - 1)
@@ -871,7 +890,7 @@ void pf2d_resample(PF2D *pf)
 
 /* Parallel gather */
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             int idx = indices[i];
             pf->prices_tmp[i] = pf->prices[idx];

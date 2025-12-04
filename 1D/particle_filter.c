@@ -273,9 +273,10 @@ void pf_initialize(ParticleFilter *pf, pf_real x0, pf_real spread)
         {
             int tid = omp_get_thread_num();
             pcg32_random_t *rng = &pf->pcg[tid];
+            int i;
 
 #pragma omp for
-            for (int i = 0; i < n; i++)
+            for (i = 0; i < n; i++)
             {
                 pf->states[i] = x0 + spread * pcg32_gaussian(rng);
             }
@@ -325,9 +326,10 @@ void pf_propagate(ParticleFilter *pf, const RegimeProbs *rp)
         {
             int tid = omp_get_thread_num();
             pcg32_random_t *rng = &pf->pcg[tid];
+            int i;
 
 #pragma omp for
-            for (int i = 0; i < n; i++)
+            for (i = 0; i < n; i++)
             {
                 /* Generate random numbers inline */
                 pf_real ui = pcg32_uniform(rng);
@@ -375,9 +377,10 @@ void pf_propagate(ParticleFilter *pf, const RegimeProbs *rp)
             }
         }
 
-/* Propagate particles */
+        /* Propagate particles */
+        int i;
 #pragma omp parallel for
-        for (int i = 0; i < n; i++)
+        for (i = 0; i < n; i++)
         {
             int lut_idx = (int)(uniform[i] * (pf_real)(PF_REGIME_LUT_SIZE - 1));
             int r = lut[lut_idx];

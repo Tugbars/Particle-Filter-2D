@@ -43,7 +43,6 @@ endif()
 option(BUILD_TESTS "Build test executables" ON)
 option(BUILD_1D "Build 1D particle filter" ON)
 option(BUILD_2D "Build 2D particle filter (stochastic vol)" ON)
-option(BUILD_KELLY "Build Kelly integration" ON)
 option(PF2D_USE_FLOAT "Use single precision for 2D filter" OFF)
 option(PF2D_HIGH_N "Enable HIGH_N mode for 50k+ particles" OFF)
 
@@ -197,24 +196,24 @@ if(BUILD_2D)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
-# Kelly Integration (header-only, but we expose include path)
+# Kelly Integration (disabled - not wired up yet)
 #───────────────────────────────────────────────────────────────────────────────
 
-if(BUILD_KELLY)
-    add_library(kelly_integration INTERFACE)
-    
-    target_include_directories(kelly_integration INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/kelly_integration
-    )
-
-    # Kelly depends on the particle filters
-    if(BUILD_1D)
-        target_link_libraries(kelly_integration INTERFACE particle_filter)
-    endif()
-    if(BUILD_2D)
-        target_link_libraries(kelly_integration INTERFACE particle_filter_2d)
-    endif()
-endif()
+# if(BUILD_KELLY)
+#     add_library(kelly_integration INTERFACE)
+#     
+#     target_include_directories(kelly_integration INTERFACE
+#         ${CMAKE_CURRENT_SOURCE_DIR}/kelly_integration
+#     )
+# 
+#     # Kelly depends on the particle filters
+#     if(BUILD_1D)
+#         target_link_libraries(kelly_integration INTERFACE particle_filter)
+#     endif()
+#     if(BUILD_2D)
+#         target_link_libraries(kelly_integration INTERFACE particle_filter_2d)
+#     endif()
+# endif()
 
 #───────────────────────────────────────────────────────────────────────────────
 # Tests / Benchmarks
@@ -242,9 +241,6 @@ if(BUILD_TESTS)
         add_executable(bench_pf2d
             test/example_usage_2d.c
         )
-        target_include_directories(bench_pf2d PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/kelly_integration
-        )
         target_link_libraries(bench_pf2d PRIVATE
             particle_filter_2d
         )
@@ -257,9 +253,6 @@ if(BUILD_TESTS)
         if(PF2D_HIGH_N)
             add_executable(bench_pf2d_high_n
                 test/example_usage_2d.c
-            )
-            target_include_directories(bench_pf2d_high_n PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/kelly_integration
             )
             target_link_libraries(bench_pf2d_high_n PRIVATE
                 particle_filter_2d
@@ -306,13 +299,14 @@ if(BUILD_2D)
     )
 endif()
 
-if(BUILD_KELLY)
-    install(FILES 
-        kelly_integration/pf_kelly_interface.h
-        kelly_integration/pf2d_kelly_interface.h
-        DESTINATION include/particle_filter
-    )
-endif()
+# Kelly integration install disabled
+# if(BUILD_KELLY)
+#     install(FILES 
+#         kelly_integration/pf_kelly_interface.h
+#         kelly_integration/pf2d_kelly_interface.h
+#         DESTINATION include/particle_filter
+#     )
+# endif()
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
@@ -325,7 +319,6 @@ message(STATUS "Compiler:         ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERS
 message(STATUS "MKL threading:    ${MKL_THREADING}")
 message(STATUS "Build 1D:         ${BUILD_1D}")
 message(STATUS "Build 2D:         ${BUILD_2D}")
-message(STATUS "Build Kelly:      ${BUILD_KELLY}")
 message(STATUS "Build tests:      ${BUILD_TESTS}")
 message(STATUS "Float precision:  ${PF2D_USE_FLOAT}")
 message(STATUS "HIGH_N mode:      ${PF2D_HIGH_N}")
