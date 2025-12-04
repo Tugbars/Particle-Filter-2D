@@ -697,23 +697,28 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
 {
     int n = pf->n_particles;
 
+    /* Local pointers avoid repeated struct dereferences in hot loops */
     pf2d_real *prices = pf->prices;
     pf2d_real *log_vols = pf->log_vols;
-    pf2d_real *vols = pf->prices_tmp;
-    pf2d_real *z1 = pf->scratch1;
-    pf2d_real *z2 = pf->scratch2;
-    pf2d_real *lw = pf->log_weights;
+    pf2d_real *vols = pf->prices_tmp;      /* Reuse tmp buffer for volatilities */
+    pf2d_real *z1 = pf->scratch1;          /* Gaussian noise for price */
+    pf2d_real *z2 = pf->scratch2;          /* Gaussian noise for volatility */
+    pf2d_real *lw = pf->log_weights;       /* Log-weights, also temp for uniform RNG */
     pf2d_real *w = pf->weights;
     int *regs = pf->regimes;
 
-    const uint8_t *lut = pf->regime_lut;
+    const uint8_t *lut = pf->regime_lut;   /* Pre-built lookup table: uniform → regime */
     const PF2DRegimeParams *params = pf->regimes_params;
-    pf2d_real nhiv = pf->neg_half_inv_var;
+    pf2d_real nhiv = pf->neg_half_inv_var; /* -0.5 / obs_variance, precomputed */
 
-    /* 1. Pre-compute vol = exp(log_vol) */
+    /* 1. Pre-compute vol = exp(log_vol) for ALL particles
+     *    MKL vExp is heavily optimized (AVX2 vectorized, threaded for large N).
+     *    Better to call once than per-particle exp() in loop. */
     pf2d_vExp(n, log_vols, vols);
 
-    /* 2. Allocate partial_max array */
+    /* 2. Allocate thread-local max accumulators on stack
+     *    Using alloca avoids heap allocation in hot path.
+     *    Array size = num_threads (16), tiny overhead. */
     int nt = omp_get_max_threads();
 #ifdef _MSC_VER
     pf2d_real *partial_max = (pf2d_real *)_alloca(nt * sizeof(pf2d_real));
@@ -721,67 +726,104 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
     pf2d_real *partial_max = (pf2d_real *)alloca(nt * sizeof(pf2d_real));
 #endif
 
+    /* Initialize to -inf so any real log-weight will be larger */
     for (int t = 0; t < nt; t++)
     {
         partial_max[t] = (pf2d_real)(-1e30);
     }
 
-    /* 3. BLOCK-PROCESSED parallel region */
+    /* 3. BLOCK-PROCESSED parallel region
+     *    Each thread owns a contiguous chunk of particles.
+     *    Within chunk, process in L2-sized blocks for cache locality. */
 #pragma omp parallel
     {
         int tid = omp_get_thread_num();
         int num_threads = omp_get_num_threads();
         
+        /* Static partitioning: each thread gets N/num_threads particles */
         int particles_per_thread = (n + num_threads - 1) / num_threads;
         int thread_start = tid * particles_per_thread;
         int thread_end = thread_start + particles_per_thread;
         if (thread_end > n) thread_end = n;
         
+        /* Thread-local max - no synchronization needed during accumulation */
         pf2d_real local_max = (pf2d_real)(-1e30);
 
+        /* Process this thread's particles in cache-friendly blocks */
         for (int block_start = thread_start; block_start < thread_end; block_start += PF2D_BLOCK_SIZE)
         {
             int block_end = block_start + PF2D_BLOCK_SIZE;
             if (block_end > thread_end) block_end = thread_end;
             int block_len = block_end - block_start;
 
-            /* RNG for this block */
+            /* === RNG PHASE ===
+             * Generate random numbers for this block only.
+             * Data lands in L2 cache, will be consumed immediately below.
+             * 
+             * Each thread has its own MKL stream (pf->mkl_rng[tid]) - no contention.
+             * SFMT19937 is fast and has good statistical properties. */
             pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              block_len, &z1[block_start], 0.0, 1.0);
             pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              block_len, &z2[block_start], 0.0, 1.0);
+            /* Uniform for regime sampling - temporarily stored in lw[] */
             pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[tid],
                             block_len, &lw[block_start], 0.0, 1.0);
 
-            /* Physics + log-likelihood for this block */
+            /* === PHYSICS + LIKELIHOOD PHASE ===
+             * Process same block while data is still in L2 cache.
+             * This is the key optimization: RNG output consumed before eviction. */
             for (int i = block_start; i < block_end; i++)
             {
+                /* --- Regime Selection ---
+                 * Convert uniform random to regime via precomputed LUT.
+                 * LUT avoids branches and cumulative probability search. */
                 int lut_idx = (int)(lw[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
                 int r = lut[lut_idx];
                 regs[i] = r;
 
+                /* Copy regime params to local (compiler may optimize to registers) */
                 PF2DRegimeParams p = params[r];
 
+                /* --- Correlated Noise Generation ---
+                 * eps_p: noise for price equation
+                 * eps_v: noise for volatility, correlated with eps_p via rho
+                 * If rho=0, eps_v = z2 (independent) */
                 pf2d_real eps_p = z1[i];
                 pf2d_real eps_v = p.rho * z1[i] + p.sqrt_one_minus_rho_sq * z2[i];
 
+                /* --- Price Dynamics ---
+                 * Arithmetic random walk with drift and stochastic volatility:
+                 *   price[t+1] = price[t] + drift + vol[t] * eps_p */
                 pf2d_real new_price = prices[i] + p.drift + vols[i] * eps_p;
                 prices[i] = new_price;
+
+                /* --- Volatility Dynamics (Ornstein-Uhlenbeck in log-space) ---
+                 *   log_vol[t+1] = (1-θ)*log_vol[t] + θ*μ + σ_v*eps_v
+                 * Mean-reverts to μ with speed θ, diffusion σ_v */
                 log_vols[i] = p.one_minus_theta * log_vols[i] +
                               p.theta_mu + p.sigma_vol * eps_v;
 
+                /* --- Log-Likelihood (Gaussian observation model) ---
+                 *   log p(obs | price) = -0.5 * (obs - price)² / var
+                 * nhiv = -0.5 / var is precomputed */
                 pf2d_real diff = observation - new_price;
                 pf2d_real logw = nhiv * diff * diff;
                 lw[i] = logw;
+
+                /* Track max for numerical stability in softmax */
                 if (logw > local_max)
                     local_max = logw;
             }
         }
 
+        /* Store thread's max for later reduction */
         partial_max[tid] = local_max;
     }
 
-    /* 4. Serial max reduction */
+    /* 4. Serial max reduction
+     *    Only nt elements (16), not worth parallelizing.
+     *    Could use atomic or reduction clause, but serial is faster here. */
     pf2d_real max_lw = partial_max[0];
     for (int t = 1; t < nt; t++)
     {
@@ -789,7 +831,14 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
             max_lw = partial_max[t];
     }
 
-    /* 5. Subtract max + exp + normalize */
+    /* 5. Normalize weights (log-sum-exp trick for numerical stability)
+     *    
+     *    Problem: exp(log_weight) can overflow/underflow
+     *    Solution: w[i] = exp(lw[i] - max_lw) / sum(exp(lw - max_lw))
+     *    
+     *    Mathematically equivalent, but keeps values in reasonable range. */
+    
+    /* 5a. Subtract max (shifts all log-weights so max becomes 0) */
     {
         int i;
 #pragma omp parallel for schedule(static)
@@ -799,16 +848,22 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
         }
     }
 
+    /* 5b. Exponentiate - MKL vectorized exp */
     pf2d_vExp(n, lw, w);
 
+    /* 5c. Sum weights - MKL BLAS L1 (highly optimized) */
     pf2d_real sum = pf2d_cblas_asum(n, w, 1);
 
+    /* 5d. Handle degenerate case - all weights underflowed
+     *     This happens when all particles are far from observation.
+     *     Reset to uniform to avoid NaN propagation. */
     if (sum == (pf2d_real)0.0 || !isfinite(sum))
     {
         pf2d_fill_constant(w, n, pf->uniform_weight);
         return;
     }
 
+    /* 5e. Normalize so weights sum to 1 - MKL BLAS scale */
     pf2d_cblas_scal(n, (pf2d_real)1.0 / sum, w, 1);
 }
 

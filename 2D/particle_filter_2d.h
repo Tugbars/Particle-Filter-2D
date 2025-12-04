@@ -174,70 +174,213 @@ typedef double pf2d_real;
      */
     typedef struct
     {
-        /* Particle state - SoA layout */
-        pf2d_real *prices;
-        pf2d_real *prices_tmp;
-        pf2d_real *log_vols;
-        pf2d_real *log_vols_tmp;
-        pf2d_real *weights;
-        pf2d_real *log_weights;
-        pf2d_real *cumsum;
-        int *regimes;
-        int *regimes_tmp;
+        /*========================================================================
+         * PARTICLE STATE - Structure of Arrays (SoA) layout
+         *
+         * Why SoA over AoS?
+         *   - SIMD (AVX2/512) can process 4-8 particles per instruction
+         *   - Better cache utilization when accessing one field across particles
+         *   - MKL vExp, cblas_* operate on contiguous arrays
+         *========================================================================*/
 
-        /* Scratch buffers */
-        pf2d_real *scratch1;
-        pf2d_real *scratch2;
-        int *indices; /* For HIGH_N resampling - proper int buffer */
+        pf2d_real *prices;     /* Current price estimate per particle [n_particles] */
+        pf2d_real *prices_tmp; /* Double-buffer for resampling swap [n_particles]
+                                * Also reused as volatility buffer in propagate */
 
-        /* RNG streams */
-        VSLStreamStatePtr mkl_rng[PF2D_MAX_THREADS];
-        pf2d_pcg32_t pcg[PF2D_MAX_THREADS];
-        int use_pcg;
-        int n_threads;
+        pf2d_real *log_vols;     /* Log-volatility state per particle [n_particles]
+                                  * Stored in log-space for numerical stability
+                                  * Actual vol = exp(log_vol) */
+        pf2d_real *log_vols_tmp; /* Double-buffer for resampling swap [n_particles] */
 
-        /* Regime lookup table */
-        uint8_t regime_lut[PF2D_REGIME_LUT_SIZE];
+        pf2d_real *weights;     /* Normalized importance weights [n_particles]
+                                 * Sum to 1.0, used for weighted estimates
+                                 * Updated each tick via likelihood */
+        pf2d_real *log_weights; /* Unnormalized log-weights [n_particles]
+                                 * Intermediate storage before softmax normalization
+                                 * Also reused for uniform RNG in propagate */
 
-        /* Per-regime parameters */
-        PF2DRegimeParams regimes_params[PF2D_MAX_REGIMES];
-        int n_regimes;
+        pf2d_real *cumsum; /* Cumulative sum of weights for resampling [n_particles]
+                            * cumsum[i] = sum(weights[0:i])
+                            * Used for systematic resampling via binary search */
 
-        /* Observation model */
-        pf2d_real obs_variance;
-        pf2d_real inv_obs_variance;
-        pf2d_real neg_half_inv_var;
+        int *regimes;     /* Current regime per particle [n_particles]
+                           * Values in [0, n_regimes-1]
+                           * Determines which dynamics parameters to use */
+        int *regimes_tmp; /* Double-buffer for resampling swap [n_particles] */
 
-        /* Adaptive resampling */
-        pf2d_real resample_threshold;
-        pf2d_real vol_ema;
-        pf2d_real vol_baseline;
+        /*========================================================================
+         * SCRATCH BUFFERS - Temporary storage reused each tick
+         *========================================================================*/
 
-        /* Dimensions */
-        int n_particles;
-        pf2d_real uniform_weight;
+        pf2d_real *scratch1; /* Gaussian noise z1 for price dynamics [n_particles] */
+        pf2d_real *scratch2; /* Gaussian noise z2 for volatility dynamics [n_particles] */
+        int *indices;        /* Resampling indices for HIGH_N mode [n_particles]
+                              * indices[i] = which particle to copy to position i */
+
+        /*========================================================================
+         * RANDOM NUMBER GENERATION
+         *
+         * Each thread has its own RNG stream to avoid contention.
+         * Two RNG options:
+         *   - MKL SFMT: High quality, vectorized, better for large N
+         *   - PCG32: Faster per-call, better for small N with inline generation
+         *========================================================================*/
+
+        VSLStreamStatePtr mkl_rng[PF2D_MAX_THREADS]; /* MKL RNG streams, one per thread
+                                                      * Seeded deterministically: 42 + tid*8192 */
+        pf2d_pcg32_t pcg[PF2D_MAX_THREADS];          /* PCG32 RNG states, one per thread
+                                                      * Lightweight alternative to MKL */
+        int use_pcg;                                 /* RNG selection flag:
+                                                      *   0 = MKL SFMT (default for N >= BLAS_THRESHOLD)
+                                                      *   1 = PCG32 (faster for small N) */
+        int n_threads;                               /* Actual thread count (capped at PF2D_MAX_THREADS) */
+
+        /*========================================================================
+         * REGIME SYSTEM
+         *
+         * Multi-regime model allows different market states:
+         *   Regime 0: Trending (positive drift, low vol)
+         *   Regime 1: Mean-reverting (zero drift, stable vol)
+         *   Regime 2: High volatility
+         *   Regime 3: Jump/crisis
+         *
+         * Regime probabilities come from external model (e.g., BOCPD).
+         *========================================================================*/
+
+        uint8_t regime_lut[PF2D_REGIME_LUT_SIZE]; /* Lookup table: uniform[0,1] → regime
+                                                   * Pre-built from regime probabilities
+                                                   * Size 256 gives ~0.4% granularity
+                                                   * Avoids branches in hot loop */
+
+        PF2DRegimeParams regimes_params[PF2D_MAX_REGIMES]; /* Dynamics parameters per regime:
+                                                            *   drift, theta_vol, mu_vol,
+                                                            *   sigma_vol, rho, + precomputed */
+        int n_regimes;                                     /* Active regime count (1-4 typically) */
+
+        /*========================================================================
+         * OBSERVATION MODEL
+         *
+         * Gaussian likelihood: p(obs | price) = N(obs; price, obs_variance)
+         * Log-likelihood: -0.5 * (obs - price)² / obs_variance
+         *
+         * Precomputed terms avoid division in hot loop.
+         *========================================================================*/
+
+        pf2d_real obs_variance;     /* Observation noise variance σ²_obs
+                                     * Represents measurement uncertainty
+                                     * Larger = more tolerant of price mismatch */
+        pf2d_real inv_obs_variance; /* 1 / obs_variance (precomputed) */
+        pf2d_real neg_half_inv_var; /* -0.5 / obs_variance (precomputed)
+                                     * Directly multiplied with squared error */
+
+        /*========================================================================
+         * ADAPTIVE RESAMPLING
+         *
+         * Resample when Effective Sample Size (ESS) drops below threshold.
+         * Threshold adapts based on volatility regime:
+         *   High vol → resample more often (lower threshold)
+         *   Low vol  → resample less often (higher threshold)
+         *========================================================================*/
+
+        pf2d_real resample_threshold; /* Current ESS threshold as fraction of N
+                                       * Resample if ESS < N * threshold
+                                       * Range: [THRESH_MIN, THRESH_MAX] */
+        pf2d_real vol_ema;            /* Exponential moving average of volatility
+                                       * Smoothed estimate for threshold adaptation
+                                       * Alpha = 0.05 (slow adaptation) */
+        pf2d_real vol_baseline;       /* Baseline volatility for threshold scaling
+                                       * Set via pf2d_set_resample_adaptive() */
+
+        /*========================================================================
+         * DIMENSIONS
+         *========================================================================*/
+
+        int n_particles;          /* Number of particles (N)
+                                   * More particles = better accuracy, higher cost
+                                   * Typical: 1000-10000 for trading */
+        pf2d_real uniform_weight; /* 1.0 / n_particles (precomputed)
+                                   * Used for weight reset after resampling */
 
     } PF2D;
 
     /**
-     * Output from pf2d_update()
+     * @brief Output from pf2d_update() - estimates and diagnostics for one tick
+     *
+     * Contains:
+     *   - Weighted mean/variance estimates for price and volatility
+     *   - Filter health metrics (ESS, regime distribution)
+     *   - Resampling flag for monitoring
+     *
+     * All estimates are importance-weighted:
+     *   E[X] = Σ weights[i] * X[i]
+     *   Var[X] = Σ weights[i] * (X[i] - E[X])²
+     *
+     * Usage:
+     *   PF2DOutput out = pf2d_update(pf, observation, &regime_probs);
+     *   double price_est = out.price_mean;
+     *   double vol_est = out.vol_mean;
+     *   if (out.ess < 1000) printf("Warning: low ESS\n");
      */
     typedef struct
     {
-        /* Price estimates */
-        pf2d_real price_mean;
-        pf2d_real price_variance;
+        /*========================================================================
+         * PRICE ESTIMATES
+         *========================================================================*/
 
-        /* Volatility estimates */
-        pf2d_real log_vol_mean;     /* E[log_vol] across particles */
-        pf2d_real log_vol_variance; /* Uncertainty in log-vol */
-        pf2d_real vol_mean;         /* E[exp(log_vol)] */
+        pf2d_real price_mean; /* Weighted mean price estimate
+                               * E[price] = Σ w[i] * price[i]
+                               * Primary output for trading signals */
 
-        /* Health metrics */
-        pf2d_real ess;
-        pf2d_real regime_probs[PF2D_MAX_REGIMES];
-        int dominant_regime;
-        int resampled;
+        pf2d_real price_variance; /* Weighted variance of price estimate
+                                   * Var[price] = Σ w[i] * (price[i] - mean)²
+                                   * Represents estimation uncertainty
+                                   * sqrt(variance) = standard error */
+
+        /*========================================================================
+         * VOLATILITY ESTIMATES
+         *
+         * Volatility is modeled in log-space for positivity and stability.
+         * Three related quantities:
+         *   log_vol_mean: E[log(vol)] - mean of log-volatility
+         *   log_vol_variance: uncertainty in log-space
+         *   vol_mean: E[vol] - actual volatility for position sizing
+         *========================================================================*/
+
+        pf2d_real log_vol_mean; /* Weighted mean of log-volatility
+                                 * E[log_vol] = Σ w[i] * log_vol[i] */
+
+        pf2d_real log_vol_variance; /* Weighted variance of log-volatility
+                                     * Var[log_vol] = Σ w[i] * (log_vol[i] - mean)²
+                                     * High variance = uncertain about vol regime */
+
+        pf2d_real vol_mean; /* Expected volatility (not log)
+                             * E[exp(log_vol)] = exp(μ + σ²/2) for log-normal
+                             * Use this for Kelly sizing, not exp(log_vol_mean) */
+
+        /*========================================================================
+         * FILTER HEALTH METRICS
+         *========================================================================*/
+
+        pf2d_real ess; /* Effective Sample Size
+                        * ESS = 1 / Σ w[i]²
+                        * Range: [1, n_particles]
+                        * ESS ≈ N: weights uniform (good)
+                        * ESS << N: weights concentrated (resample needed)
+                        * Rule of thumb: resample if ESS < N/2 */
+
+        pf2d_real regime_probs[PF2D_MAX_REGIMES]; /* Posterior regime distribution
+                                                   * regime_probs[r] = Σ w[i] for particles in regime r
+                                                   * Sums to 1.0
+                                                   * Useful for regime detection */
+
+        int dominant_regime; /* Most likely regime: argmax(regime_probs)
+                              * Quick indicator of market state */
+
+        int resampled; /* Flag: did resampling occur this tick?
+                        * 0 = no resampling (ESS was healthy)
+                        * 1 = resampled (weights were reset to uniform)
+                        * High resample rate may indicate model mismatch */
+
     } PF2DOutput;
 
     /*============================================================================
