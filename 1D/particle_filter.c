@@ -377,27 +377,30 @@ void pf_propagate(ParticleFilter *pf, const RegimeProbs *rp)
             }
         }
 
-        /* Propagate particles */
-        int i;
-#pragma omp parallel for
-        for (i = 0; i < n; i++)
+/* Propagate particles */
+#pragma omp parallel
         {
-            int lut_idx = (int)(uniform[i] * (pf_real)(PF_REGIME_LUT_SIZE - 1));
-            int r = lut[lut_idx];
-            reg[i] = r;
-
-            pf_real xi = x[i];
-            pf_real wi = noise[i];
-
-            if (theta[r] > (pf_real)0.0)
+            int i;
+#pragma omp for
+            for (i = 0; i < n; i++)
             {
-                xi = omt[r] * xi + tm[r] + sigma_s[r] * wi;
+                int lut_idx = (int)(uniform[i] * (pf_real)(PF_REGIME_LUT_SIZE - 1));
+                int r = lut[lut_idx];
+                reg[i] = r;
+
+                pf_real xi = x[i];
+                pf_real wi = noise[i];
+
+                if (theta[r] > (pf_real)0.0)
+                {
+                    xi = omt[r] * xi + tm[r] + sigma_s[r] * wi;
+                }
+                else
+                {
+                    xi = xi + drift_s[r] + sigma_s[r] * wi;
+                }
+                x[i] = xi;
             }
-            else
-            {
-                xi = xi + drift_s[r] + sigma_s[r] * wi;
-            }
-            x[i] = xi;
         }
     }
 }
