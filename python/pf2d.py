@@ -265,7 +265,7 @@ def _get_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     if _lib is None or lib_path is not None:
         _lib = _load_library(lib_path)
         _setup_signatures(_lib)
-        _lib.pf2d_mkl_config_14900kf(0)  # Configure 16 P-core threads
+        #_lib.pf2d_mkl_config_14900kf(0)  # Configure 16 P-core threads
     return _lib
 
 
@@ -593,7 +593,7 @@ def create_default_filter(n_particles: int = 4000, lib_path: Optional[str] = Non
     pf.set_regime_probs([0.4, 0.3, 0.2, 0.1])
     
     # Observation variance
-    pf.set_observation_variance(0.0001)
+    pf.set_observation_variance(1.0)
     
     return pf
 

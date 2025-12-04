@@ -266,6 +266,24 @@ if(BUILD_TESTS)
     endif()
 endif()
 
+# Test suite for Particle Filter 2D
+
+add_executable(test_pf2d
+    test/test_particle_filter_2d.c
+)
+
+target_include_directories(test_pf2d PRIVATE 
+    ${CMAKE_SOURCE_DIR}/2D
+)
+
+target_link_libraries(test_pf2d PRIVATE 
+    particle_filter_2d
+)
+
+# Add as CTest
+enable_testing()
+add_test(NAME particle_filter_tests COMMAND test_pf2d)
+
 #───────────────────────────────────────────────────────────────────────────────
 # Install
 #───────────────────────────────────────────────────────────────────────────────
@@ -308,6 +326,7 @@ endif()
 #         DESTINATION include/particle_filter
 #     )
 # endif()
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
