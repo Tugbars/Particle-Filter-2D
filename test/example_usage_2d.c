@@ -299,7 +299,7 @@ int main(int argc, char *argv[])
     pf2d_real initial_log_vol = log(0.01);
     pf2d_initialize(pf, initial_price, 1.0, initial_log_vol, 0.1);
 
-    pf2d_enable_pcg(pf, 1);
+    pf2d_enable_pcg(pf, 0);
     pf2d_set_resample_adaptive(pf, 0.01);
 
     pf2d_print_config(pf);
