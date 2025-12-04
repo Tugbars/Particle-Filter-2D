@@ -680,18 +680,19 @@ static void pf2d_propagate_vectorized(PF2D *pf)
 }
 
 /**
- * @brief FUSED propagate + weight update - eliminates parallel region barriers
+ * @brief FUSED propagate + weight update with BLOCK PROCESSING
  *
- * Combines RNG generation, physics update, and log-likelihood computation
- * into a single parallel region. This eliminates 2-3 barrier synchronizations.
+ * Cache optimization: Process particles in L2-sized blocks.
+ * For each block: RNG → physics → log-likelihood
+ * This keeps working data in L2 (~256KB per P-core) instead of
+ * streaming through and evicting before reuse.
  *
- * Flow:
- *   1. vdExp for vol = exp(log_vol)
- *   2. Single parallel region: RNG → physics → log-likelihood + local_max
- *   3. Serial max reduction
- *   4. vdExp for weights
- *   5. BLAS normalize
+ * Block size 4096 doubles = 32KB per array
+ * With 3 arrays (z1, z2, prices) = ~96KB working set per block
+ * Fits comfortably in 256KB L2 cache.
  */
+#define PF2D_BLOCK_SIZE 4096
+
 static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
 {
     int n = pf->n_particles;
@@ -712,7 +713,7 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
     /* 1. Pre-compute vol = exp(log_vol) */
     pf2d_vExp(n, log_vols, vols);
 
-    /* 2. Allocate partial_max array for max reduction */
+    /* 2. Allocate partial_max array */
     int nt = omp_get_max_threads();
 #ifdef _MSC_VER
     pf2d_real *partial_max = (pf2d_real *)_alloca(nt * sizeof(pf2d_real));
@@ -720,48 +721,47 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
     pf2d_real *partial_max = (pf2d_real *)alloca(nt * sizeof(pf2d_real));
 #endif
 
-/* 3. SINGLE FUSED PARALLEL REGION:
- *    - Generate RNG (per-thread chunk)
- *    - Physics update (immediate after RNG)
- *    - Log-likelihood + local_max (immediate after physics)
- *
- *    This eliminates 2 barrier syncs vs separate regions. */
+    for (int t = 0; t < nt; t++)
+    {
+        partial_max[t] = (pf2d_real)(-1e30);
+    }
+
+    /* 3. BLOCK-PROCESSED parallel region */
 #pragma omp parallel
     {
         int tid = omp_get_thread_num();
         int num_threads = omp_get_num_threads();
-        int chunk = (n + num_threads - 1) / num_threads;
-        int start = tid * chunk;
-        int end = start + chunk;
-        if (end > n)
-            end = n;
-        int len = end - start;
-
+        
+        int particles_per_thread = (n + num_threads - 1) / num_threads;
+        int thread_start = tid * particles_per_thread;
+        int thread_end = thread_start + particles_per_thread;
+        if (thread_end > n) thread_end = n;
+        
         pf2d_real local_max = (pf2d_real)(-1e30);
 
-        if (len > 0)
+        for (int block_start = thread_start; block_start < thread_end; block_start += PF2D_BLOCK_SIZE)
         {
-            /* Generate RNG for this thread's chunk */
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
-                             len, &z1[start], 0.0, 1.0);
-            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
-                             len, &z2[start], 0.0, 1.0);
+            int block_end = block_start + PF2D_BLOCK_SIZE;
+            if (block_end > thread_end) block_end = thread_end;
+            int block_len = block_end - block_start;
 
-            /* Generate uniform for regime sampling - reuse lw buffer temporarily */
+            /* RNG for this block */
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
+                             block_len, &z1[block_start], 0.0, 1.0);
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
+                             block_len, &z2[block_start], 0.0, 1.0);
             pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[tid],
-                            len, &lw[start], 0.0, 1.0);
+                            block_len, &lw[block_start], 0.0, 1.0);
 
-            /* Fused physics + log-likelihood for this chunk */
-            for (int i = start; i < end; i++)
+            /* Physics + log-likelihood for this block */
+            for (int i = block_start; i < block_end; i++)
             {
-                /* Regime lookup */
                 int lut_idx = (int)(lw[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
                 int r = lut[lut_idx];
                 regs[i] = r;
 
                 PF2DRegimeParams p = params[r];
 
-                /* Physics update */
                 pf2d_real eps_p = z1[i];
                 pf2d_real eps_v = p.rho * z1[i] + p.sqrt_one_minus_rho_sq * z2[i];
 
@@ -770,7 +770,6 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
                 log_vols[i] = p.one_minus_theta * log_vols[i] +
                               p.theta_mu + p.sigma_vol * eps_v;
 
-                /* Log-likelihood (immediately uses new_price) */
                 pf2d_real diff = observation - new_price;
                 pf2d_real logw = nhiv * diff * diff;
                 lw[i] = logw;
@@ -790,11 +789,10 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
             max_lw = partial_max[t];
     }
 
-/* 5. Subtract max + exp + normalize */
-#pragma omp parallel
+    /* 5. Subtract max + exp + normalize */
     {
         int i;
-#pragma omp for schedule(static)
+#pragma omp parallel for schedule(static)
         for (i = 0; i < n; i++)
         {
             lw[i] -= max_lw;
@@ -807,9 +805,7 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
 
     if (sum == (pf2d_real)0.0 || !isfinite(sum))
     {
-        pf2d_real uw = pf->uniform_weight;
-        for (int i = 0; i < n; i++)
-            w[i] = uw;
+        pf2d_fill_constant(w, n, pf->uniform_weight);
         return;
     }
 
