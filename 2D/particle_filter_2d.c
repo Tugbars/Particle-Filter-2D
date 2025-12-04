@@ -1197,6 +1197,58 @@ pf2d_real pf2d_vol_mean(const PF2D *pf)
     return (pf2d_real)exp((double)(mu + var * (pf2d_real)0.5));
 }
 
+/**
+ * @brief Compute all estimates in 2 fused passes (vs 10+ separate passes)
+ *
+ * Pass 1: means + ESS (sum of w*p, w*lv, w*w)
+ * Pass 2: variances (using means from pass 1)
+ */
+static void pf2d_compute_estimates_fused(const PF2D *pf, PF2DOutput *out)
+{
+    int n = pf->n_particles;
+    const pf2d_real *w = pf->weights;
+    const pf2d_real *p = pf->prices;
+    const pf2d_real *lv = pf->log_vols;
+
+    /* Pass 1: Accumulate means and ESS */
+    pf2d_real sum_wp = 0, sum_wlv = 0, sum_ww = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+        pf2d_real wi = w[i];
+        sum_wp += wi * p[i];
+        sum_wlv += wi * lv[i];
+        sum_ww += wi * wi;
+    }
+
+    pf2d_real price_mean = sum_wp;
+    pf2d_real log_vol_mean = sum_wlv;
+    pf2d_real ess = (sum_ww > 0) ? (pf2d_real)1.0 / sum_ww : (pf2d_real)n;
+
+    /* Pass 2: Variances */
+    pf2d_real sum_price_var = 0, sum_lv_var = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+        pf2d_real wi = w[i];
+        pf2d_real dp = p[i] - price_mean;
+        pf2d_real dlv = lv[i] - log_vol_mean;
+        sum_price_var += wi * dp * dp;
+        sum_lv_var += wi * dlv * dlv;
+    }
+
+    /* Vol mean using log-normal formula: E[e^X] = e^(μ + σ²/2) */
+    pf2d_real vol_mean = (pf2d_real)exp((double)(log_vol_mean + sum_lv_var * 0.5));
+
+    /* Store results */
+    out->price_mean = price_mean;
+    out->price_variance = sum_price_var;
+    out->log_vol_mean = log_vol_mean;
+    out->log_vol_variance = sum_lv_var;
+    out->vol_mean = vol_mean;
+    out->ess = ess;
+}
+
 /*============================================================================
  * FULL UPDATE
  *============================================================================*/
@@ -1227,13 +1279,8 @@ PF2DOutput pf2d_update(PF2D *pf, pf2d_real observation, const PF2DRegimeProbs *r
         pf2d_update_weights(pf, observation);
     }
 
-    /* 3. Compute estimates */
-    out.price_mean = pf2d_price_mean(pf);
-    out.price_variance = pf2d_price_variance(pf);
-    out.log_vol_mean = pf2d_log_vol_mean(pf);
-    out.log_vol_variance = pf2d_log_vol_variance(pf);
-    out.vol_mean = pf2d_vol_mean(pf);
-    out.ess = pf2d_effective_sample_size(pf);
+    /* 3. Compute estimates (fused: 2 passes vs 10+) */
+    pf2d_compute_estimates_fused(pf, &out);
 
     /* Regime distribution */
     for (int r = 0; r < PF2D_MAX_REGIMES; r++)
