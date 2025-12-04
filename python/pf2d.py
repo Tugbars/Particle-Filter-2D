@@ -247,6 +247,9 @@ def _setup_signatures(lib: ctypes.CDLL):
     # pf2d_effective_sample_size
     lib.pf2d_effective_sample_size.argtypes = [c_void_p]
     lib.pf2d_effective_sample_size.restype = c_double
+    
+    lib.pf2d_mkl_config_14900kf.argtypes = [c_int]
+    lib.pf2d_mkl_config_14900kf.restype = None
 
 
 # =============================================================================
@@ -262,6 +265,7 @@ def _get_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
     if _lib is None or lib_path is not None:
         _lib = _load_library(lib_path)
         _setup_signatures(_lib)
+        _lib.pf2d_mkl_config_14900kf(0)  # Configure 16 P-core threads
     return _lib
 
 

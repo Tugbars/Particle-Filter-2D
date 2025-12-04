@@ -35,3 +35,7 @@ EXPORTS
     ; Debug
     pf2d_print_config
     pf2d_precompute
+
+    pf2d_mkl_config_14900kf
+
+

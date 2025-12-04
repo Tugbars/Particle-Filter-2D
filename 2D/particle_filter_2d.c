@@ -8,6 +8,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <omp.h>
+#include "mkl_config.h"
+
 
 /* alloca: MSVC uses _alloca from malloc.h, others use alloca.h */
 #ifdef _MSC_VER
@@ -1451,5 +1453,28 @@ void pf2d_print_config(const PF2D *pf)
         printf("  %-8d %8.4f %8.4f %8.4f %8.4f %8.4f\n",
                r, (double)p->drift, (double)p->theta_vol,
                (double)p->mu_vol, (double)p->sigma_vol, (double)p->rho);
+    }
+}
+
+/* Wrapper to export mkl_config function */
+void pf2d_mkl_config_14900kf(int verbose) {
+    /* Set P-core affinity */
+    #ifdef _WIN32
+    _putenv_s("KMP_AFFINITY", "granularity=fine,compact,1,0");
+    _putenv_s("KMP_HW_SUBSET", "8c,2t");
+    _putenv_s("MKL_ENABLE_INSTRUCTIONS", "AVX2");
+    #else
+    setenv("KMP_AFFINITY", "granularity=fine,compact,1,0", 1);
+    setenv("KMP_HW_SUBSET", "8c,2t", 1);
+    setenv("MKL_ENABLE_INSTRUCTIONS", "AVX2", 1);
+    #endif
+    
+    /* 16 P-core threads */
+    omp_set_num_threads(16);
+    mkl_set_num_threads(16);
+    mkl_set_dynamic(0);
+    
+    if (verbose) {
+        printf("MKL configured: 16 P-core threads, AVX2, P-core affinity\n");
     }
 }
