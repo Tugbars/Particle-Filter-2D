@@ -691,7 +691,7 @@ static void pf2d_propagate_vectorized(PF2D *pf)
  * With 3 arrays (z1, z2, prices) = ~96KB working set per block
  * Fits comfortably in 256KB L2 cache.
  */
-#define PF2D_BLOCK_SIZE 4096
+#define PF2D_BLOCK_SIZE 4126
 
 static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
 {
@@ -1305,41 +1305,42 @@ static void pf2d_compute_estimates_fused(const PF2D *pf, PF2DOutput *out)
     const pf2d_real *p = pf->prices;
     const pf2d_real *lv = pf->log_vols;
 
-    /* Pass 1: Accumulate means and ESS */
+    /* SINGLE PASS using E[X²] - E[X]² formula for variance
+     * Reads each array only once - better cache utilization */
     pf2d_real sum_wp = 0, sum_wlv = 0, sum_ww = 0;
+    pf2d_real sum_wp2 = 0, sum_wlv2 = 0;  /* For E[X²] */
 
     for (int i = 0; i < n; i++)
     {
         pf2d_real wi = w[i];
-        sum_wp += wi * p[i];
-        sum_wlv += wi * lv[i];
-        sum_ww += wi * wi;
+        pf2d_real pi = p[i];
+        pf2d_real lvi = lv[i];
+        
+        sum_wp  += wi * pi;
+        sum_wlv += wi * lvi;
+        sum_ww  += wi * wi;
+        sum_wp2 += wi * pi * pi;
+        sum_wlv2 += wi * lvi * lvi;
     }
 
     pf2d_real price_mean = sum_wp;
     pf2d_real log_vol_mean = sum_wlv;
     pf2d_real ess = (sum_ww > 0) ? (pf2d_real)1.0 / sum_ww : (pf2d_real)n;
 
-    /* Pass 2: Variances */
-    pf2d_real sum_price_var = 0, sum_lv_var = 0;
+    /* Var(X) = E[X²] - E[X]² */
+    pf2d_real price_variance = sum_wp2 - sum_wp * sum_wp;
+    pf2d_real log_vol_variance = sum_wlv2 - sum_wlv * sum_wlv;
+    
+    /* Clamp to avoid negative variance from numerical error */
+    if (price_variance < 0) price_variance = 0;
+    if (log_vol_variance < 0) log_vol_variance = 0;
 
-    for (int i = 0; i < n; i++)
-    {
-        pf2d_real wi = w[i];
-        pf2d_real dp = p[i] - price_mean;
-        pf2d_real dlv = lv[i] - log_vol_mean;
-        sum_price_var += wi * dp * dp;
-        sum_lv_var += wi * dlv * dlv;
-    }
+    pf2d_real vol_mean = (pf2d_real)exp((double)(log_vol_mean + log_vol_variance * 0.5));
 
-    /* Vol mean using log-normal formula: E[e^X] = e^(μ + σ²/2) */
-    pf2d_real vol_mean = (pf2d_real)exp((double)(log_vol_mean + sum_lv_var * 0.5));
-
-    /* Store results */
     out->price_mean = price_mean;
-    out->price_variance = sum_price_var;
+    out->price_variance = price_variance;
     out->log_vol_mean = log_vol_mean;
-    out->log_vol_variance = sum_lv_var;
+    out->log_vol_variance = log_vol_variance;
     out->vol_mean = vol_mean;
     out->ess = ess;
 }
