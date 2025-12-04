@@ -1,0 +1,37 @@
+LIBRARY particle_filter_2d
+EXPORTS
+    ; Creation / Destruction
+    pf2d_create
+    pf2d_destroy
+    
+    ; Configuration
+    pf2d_set_observation_variance
+    pf2d_set_regime_params
+    pf2d_set_regime_probs
+    pf2d_build_regime_lut
+    pf2d_enable_pcg
+    pf2d_set_resample_adaptive
+    
+    ; Initialization
+    pf2d_initialize
+    pf2d_warmup
+    pf2d_disable_denormals_all_threads
+    
+    ; Core Operations
+    pf2d_propagate
+    pf2d_update_weights
+    pf2d_resample
+    pf2d_resample_if_needed
+    pf2d_update
+    
+    ; Estimates
+    pf2d_price_mean
+    pf2d_price_variance
+    pf2d_log_vol_mean
+    pf2d_log_vol_variance
+    pf2d_vol_mean
+    pf2d_effective_sample_size
+    
+    ; Debug
+    pf2d_print_config
+    pf2d_precompute
