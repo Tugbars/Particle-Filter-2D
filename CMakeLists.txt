@@ -187,11 +187,12 @@ if(BUILD_2D)
     )
 
     if(WIN32)
-        set_target_properties(particle_filter_2d_shared PROPERTIES
-            WINDOWS_EXPORT_ALL_SYMBOLS ON
+        # Use explicit .def file for controlled exports
+        target_sources(particle_filter_2d_shared PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/2D/particle_filter_2d.def
         )
     else()
-        set_target_properties(particle_filter_2d_shared PROPERTIES PREFIX "")
+        set_target_properties(particle_filter_shared PROPERTIES PREFIX "")
     endif()
 endif()
 
