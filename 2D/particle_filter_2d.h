@@ -26,6 +26,8 @@ extern "C"
      * PRECISION CONFIGURATION
      *============================================================================*/
 
+     #define PF2D_USE_FLOAT
+
 #ifdef PF2D_USE_FLOAT
     typedef float pf2d_real;
 #define PF2D_REAL_SIZE 4

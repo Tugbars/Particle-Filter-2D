@@ -691,7 +691,7 @@ static void pf2d_propagate_vectorized(PF2D *pf)
  * With 3 arrays (z1, z2, prices) = ~96KB working set per block
  * Fits comfortably in 256KB L2 cache.
  */
-#define PF2D_BLOCK_SIZE 4126
+#define PF2D_BLOCK_SIZE 4096
 
 static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
 {
