@@ -60,7 +60,7 @@ typedef double pf2d_real;
 #define PF2D_REGIME_LUT_SIZE 1024
 
 /* BLAS threshold */
-#define PF2D_BLAS_THRESHOLD 500
+#define PF2D_BLAS_THRESHOLD 4000
 
 /* Adaptive resampling */
 #define PF2D_RESAMPLE_THRESH_MIN 0.3
