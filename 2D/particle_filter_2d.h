@@ -300,6 +300,12 @@ typedef double pf2d_real;
     /* Full update */
     PF2DOutput pf2d_update(PF2D *pf, pf2d_real observation, const PF2DRegimeProbs *rp);
 
+    /* Warmup - eliminates first-call latency from MKL/OpenMP */
+    void pf2d_warmup(PF2D *pf);
+
+    /* Disable denormals (FTZ+DAZ) for speed - called automatically by pf2d_warmup */
+    void pf2d_disable_denormals_all_threads(void);
+
     /* Debug */
     void pf2d_print_config(const PF2D *pf);
 

@@ -9,7 +9,10 @@
 #include <stdio.h>
 #include <omp.h>
 
-#ifdef PF2D_HIGH_N
+/* alloca: MSVC uses _alloca from malloc.h, others use alloca.h */
+#ifdef _MSC_VER
+#include <malloc.h>
+#else
 #include <alloca.h>
 #endif
 
@@ -661,7 +664,11 @@ static void pf2d_update_weights_vectorized(PF2D *pf, pf2d_real observation)
      *    Use partial_max array to avoid slow critical section.
      *    MSVC OpenMP 2.0 doesn't support reduction(max:). */
     int nt = omp_get_max_threads();
+#ifdef _MSC_VER
+    pf2d_real *partial_max = (pf2d_real *)_alloca(nt * sizeof(pf2d_real));
+#else
     pf2d_real *partial_max = (pf2d_real *)alloca(nt * sizeof(pf2d_real));
+#endif
 
 #pragma omp parallel
     {
@@ -1140,6 +1147,98 @@ PF2DOutput pf2d_update(PF2D *pf, pf2d_real observation, const PF2DRegimeProbs *r
     out.resampled = pf2d_resample_if_needed(pf);
 
     return out;
+}
+
+/*============================================================================
+ * WARMUP - Eliminate first-call latency
+ *============================================================================*/
+
+/* Headers for FTZ/DAZ (denormal control) */
+#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86)
+#include <xmmintrin.h> /* SSE: _MM_SET_FLUSH_ZERO_MODE */
+#include <pmmintrin.h> /* SSE3: _MM_SET_DENORMALS_ZERO_MODE */
+#endif
+
+/**
+ * @brief Disable denormalized floating point numbers for speed.
+ *
+ * Denormals (subnormals) are tiny numbers near zero that require
+ * microcode handling, causing 10-100x slowdowns when encountered.
+ * In particle filter code, denormals mean "effectively zero" anyway.
+ *
+ * FTZ (Flush To Zero): Denormal RESULTS become zero
+ * DAZ (Denormals Are Zero): Denormal INPUTS treated as zero
+ */
+static void pf2d_disable_denormals(void)
+{
+#if defined(__SSE__) || defined(_M_X64) || defined(_M_IX86)
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
+/**
+ * @brief Disable denormals on main thread and all OpenMP threads.
+ * Call once at startup before any parallel work.
+ */
+void pf2d_disable_denormals_all_threads(void)
+{
+    /* Main thread */
+    pf2d_disable_denormals();
+
+/* All OpenMP threads */
+#pragma omp parallel
+    {
+        pf2d_disable_denormals();
+    }
+}
+
+void pf2d_warmup(PF2D *pf)
+{
+    int n = pf->n_particles;
+
+    /* 0. Disable denormals on main thread */
+    pf2d_disable_denormals();
+
+/* 1. Force OpenMP thread pool creation AND disable denormals per-thread.
+ *    MXCSR (FTZ/DAZ) is per-thread, must be set in each thread.
+ *    First parallel region has ~1-2ms overhead for thread spawning. */
+#pragma omp parallel
+    {
+        /* Disable denormals on this thread */
+        pf2d_disable_denormals();
+
+        volatile int tid = omp_get_thread_num();
+        (void)tid;
+    }
+
+/* 2. Warmup MKL RNG - each thread, each distribution type
+ *    First VSL calls trigger internal initialization. */
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int nt = omp_get_num_threads();
+        int chunk = (n + nt - 1) / nt;
+        int start = tid * chunk;
+        int len = (start + chunk > n) ? n - start : chunk;
+        if (len > 0 && start < n)
+        {
+            pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2,
+                             pf->mkl_rng[tid], len, &pf->scratch1[start], 0.0, 1.0);
+            pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD,
+                            pf->mkl_rng[tid], len, &pf->scratch2[start], 0.0, 1.0);
+        }
+    }
+
+    /* 3. Warmup MKL VML (vdExp/vsExp)
+     *    First call triggers kernel selection based on CPU features. */
+    pf2d_vExp(n, pf->log_vols, pf->prices_tmp);
+
+    /* 4. Warmup MKL BLAS (cblas_dasum, cblas_dscal)
+     *    First calls may trigger threading setup. */
+    volatile pf2d_real sum = pf2d_cblas_asum(n, pf->weights, 1);
+    pf2d_cblas_scal(n, (pf2d_real)1.0, pf->weights, 1);
+    (void)sum;
 }
 
 /*============================================================================
