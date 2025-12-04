@@ -18,9 +18,54 @@
 #include <alloca.h>
 #endif
 
+#if defined(__AVX2__) || defined(__AVX__)
+#include <immintrin.h>
+#define PF2D_HAS_AVX 1
+#else
+#define PF2D_HAS_AVX 0
+#endif
+
+
 /*============================================================================
  * HELPERS
  *============================================================================*/
+
+ /**
+ * @brief AVX2 vectorized fill - 4 doubles per store vs 1
+ * 
+ * Used for weight reset after resampling.
+ * Arrays are 64-byte aligned from mkl_malloc.
+ */
+static inline void pf2d_fill_constant(pf2d_real *arr, int n, pf2d_real val)
+{
+#if PF2D_HAS_AVX
+    int i = 0;
+    
+#if PF2D_REAL_SIZE == 8  /* double */
+    __m256d v_val = _mm256_set1_pd(val);
+    for (; i <= n - 4; i += 4)
+    {
+        _mm256_store_pd(&arr[i], v_val);
+    }
+#else  /* float */
+    __m256 v_val = _mm256_set1_ps(val);
+    for (; i <= n - 8; i += 8)
+    {
+        _mm256_store_ps(&arr[i], v_val);
+    }
+#endif
+    /* Scalar tail */
+    for (; i < n; i++)
+    {
+        arr[i] = val;
+    }
+#else
+    for (int i = 0; i < n; i++)
+    {
+        arr[i] = val;
+    }
+#endif
+}
 
 static inline pf2d_real *aligned_alloc_real(int n)
 {
@@ -1108,10 +1153,7 @@ void pf2d_resample(PF2D *pf)
     pf->regimes_tmp = tmp_i;
 
     /* Reset weights */
-    for (int i = 0; i < n; i++)
-    {
-        w[i] = inv_n;
-    }
+     pf2d_fill_constant(w, n, inv_n);
 }
 
 static inline void pf2d_update_resample_threshold(PF2D *pf, pf2d_real current_vol)
@@ -1306,7 +1348,16 @@ PF2DOutput pf2d_update(PF2D *pf, pf2d_real observation, const PF2DRegimeProbs *r
     pf2d_update_resample_threshold(pf, out.vol_mean);
 
     /* 5. Resample if needed */
-    out.resampled = pf2d_resample_if_needed(pf);
+    /* Use pre-computed ESS - avoids redundant cblas_dot call */
+    if (out.ess < pf->n_particles * pf->resample_threshold)
+    {
+        pf2d_resample(pf);
+        out.resampled = 1;
+    }
+    else
+    {
+        out.resampled = 0;
+    }
 
     return out;
 }
