@@ -4,18 +4,20 @@
  *
  * Optimizations:
  *   - Arena allocation: Single contiguous block for particle arrays (better dTLB)
+ *   - Single VSL stream per state (avoids N*N stream explosion in parallel)
  *   - VSL SFMT19937 RNG with ICDF method (faster than BoxMuller)
  *   - VML vdExp for vectorized exp (standard precision)
  *   - OpenMP SIMD for particle loops
  *   - Reciprocal multiplication instead of division
  *   - Precomputed CDF for resampling with forced endpoint
  *   - Thread-local state reuse (avoids vslNewStream overhead)
- *   - Restrict pointers for aliasing safety
+ *   - Direct gather in resampling (no temp buffer - disjoint arrays)
  *   - Single-pass mean/variance computation
  *
  * Threading model:
  *   - MKL internal: single-threaded (vectors too small to benefit)
  *   - Chain level: OpenMP parallel with thread-local states
+ *   - Each thread has its own PMMHState with single VSL stream
  *
  * Memory layout:
  *   - All particle arrays in single 64-byte aligned arena
@@ -88,9 +90,8 @@ typedef struct
     double *uniform;     /* [n_particles] uniform noise for resampling */
     int *ancestors;      /* [n_particles] resampling indices */
 
-    /* VSL streams - one per thread for parallel RNG */
-    VSLStreamStatePtr *streams;
-    int n_threads;
+    /* Single VSL stream - each thread-local state has its own */
+    VSLStreamStatePtr stream;
     int n_particles;
 
     /* Model parameters */
@@ -127,17 +128,8 @@ static PMMHState *pmmh_state_create(int n_particles, double theta_vol)
     s->uniform = (double *)(arena + 5 * d_size);
     s->ancestors = (int *)(arena + 6 * d_size);
 
-    /* Store arena base for cleanup */
-    s->n_threads = omp_get_max_threads();
-
-    /* Create VSL streams - one per thread */
-    s->streams = (VSLStreamStatePtr *)malloc(s->n_threads * sizeof(VSLStreamStatePtr));
-
-    for (int i = 0; i < s->n_threads; i++)
-    {
-        /* Use SFMT19937 - SIMD-optimized Mersenne Twister, fastest for bulk */
-        vslNewStream(&s->streams[i], VSL_BRNG_SFMT19937, 12345 + i * 7919);
-    }
+    /* Single VSL stream - SFMT19937 is SIMD-optimized Mersenne Twister */
+    vslNewStream(&s->stream, VSL_BRNG_SFMT19937, 12345);
 
     return s;
 }
@@ -147,11 +139,7 @@ static void pmmh_state_destroy(PMMHState *s)
     if (!s)
         return;
 
-    for (int i = 0; i < s->n_threads; i++)
-    {
-        vslDeleteStream(&s->streams[i]);
-    }
-    free(s->streams);
+    vslDeleteStream(&s->stream);
 
     /* Single free for arena (log_vol is base pointer) */
     mkl_free(s->log_vol);
@@ -161,23 +149,21 @@ static void pmmh_state_destroy(PMMHState *s)
 
 static void pmmh_state_seed(PMMHState *s, unsigned int seed)
 {
-    for (int i = 0; i < s->n_threads; i++)
-    {
-        vslDeleteStream(&s->streams[i]);
-        vslNewStream(&s->streams[i], VSL_BRNG_SFMT19937, seed + i * 7919);
-    }
+    vslDeleteStream(&s->stream);
+    vslNewStream(&s->stream, VSL_BRNG_SFMT19937, seed);
 }
 
 /*============================================================================
  * VECTORIZED PARTICLE FILTER LOG-LIKELIHOOD
  *
  * Optimizations applied:
- *   1. SFMT19937 RNG with ICDF method
- *   2. vdExp for vectorized exp
- *   3. Reciprocal multiplication instead of division
- *   4. SIMD loops with #pragma omp simd
- *   5. Precomputed CDF for resampling (forced to 1.0 endpoint)
- *   6. Restrict pointers for aliasing safety
+ *   1. Single SFMT19937 RNG per state (not per-thread array)
+ *   2. ICDF method for Gaussian generation
+ *   3. vdExp for vectorized exp
+ *   4. Reciprocal multiplication instead of division
+ *   5. SIMD loops with #pragma omp simd
+ *   6. Precomputed CDF for resampling (forced to 1.0 endpoint)
+ *   7. Direct gather (no temp buffer - disjoint arrays)
  *============================================================================*/
 
 static double pmmh_log_likelihood_mkl(PMMHState *s,
@@ -191,10 +177,8 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
     const double drift = params->drift;
     const double sigma_vol = params->sigma_vol;
 
-    int tid = omp_get_thread_num();
-
     /* Initialize particles at mu_vol with some spread */
-    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->streams[tid],
+    vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->stream,
                   np, s->log_vol, params->mu_vol, 0.3);
 
     double total_log_lik = 0.0;
@@ -205,7 +189,7 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
         const double ret_minus_drift = ret - drift;
 
         /* Generate noise for volatility evolution */
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->streams[tid],
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->stream,
                       np, s->noise, 0.0, sigma_vol);
 
 /* Propagate volatility (SIMD) */
@@ -274,7 +258,7 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
 
             /* Generate single uniform */
             double u0;
-            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->streams[tid],
+            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->stream,
                          1, &u0, 0.0, 1.0);
             double inv_np = 1.0 / np;
             u0 *= inv_np;
@@ -293,21 +277,12 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
                 s->ancestors[i] = j;
             }
 
-            /* Gather resampled particles (use restrict to prevent aliasing) */
-            double *restrict tmp = s->noise;
-            const double *restrict src = s->log_vol_new;
-            const int *restrict idx = s->ancestors;
-
-            for (int i = 0; i < np; i++)
-            {
-                tmp[i] = src[idx[i]];
-            }
-
-            double *restrict dst = s->log_vol;
+/* Direct gather - no temp buffer needed because log_vol and
+ * log_vol_new are disjoint regions in the arena */
 #pragma omp simd
             for (int i = 0; i < np; i++)
             {
-                dst[i] = tmp[i];
+                s->log_vol[i] = s->log_vol_new[s->ancestors[i]];
             }
         }
     }
@@ -343,13 +318,13 @@ static double pmmh_log_prior(const PMMHParams *p, const PMMHPrior *prior)
  *============================================================================*/
 
 #define PMMH_ADAPT_WINDOW 50    /* Samples before adapting */
-#define PMMH_TARGET_ACCEPT 0.30 /* Target 30% - works better with noisy likelihood */
-#define PMMH_ACCEPT_TOL 0.10    /* Wider tolerance band */
+#define PMMH_TARGET_ACCEPT 0.25 /* Target 25% - optimal for 3 params */
+#define PMMH_ACCEPT_TOL 0.05    /* Tight tolerance */
 
-/* Initial proposal scales - larger = lower acceptance rate */
-#define PMMH_INIT_DRIFT_STD 0.001
-#define PMMH_INIT_MU_STD 0.15
-#define PMMH_INIT_SIGMA_LOG_STD 0.10
+/* Initial proposal scales - larger for better exploration */
+#define PMMH_INIT_DRIFT_STD 0.0015
+#define PMMH_INIT_MU_STD 0.25
+#define PMMH_INIT_SIGMA_LOG_STD 0.15
 
 typedef struct
 {
@@ -424,8 +399,6 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
     PMMHState *state = pmmh_state_create(n_particles, theta_vol);
     pmmh_state_seed(state, seed);
 
-    int tid = omp_get_thread_num();
-
     /* Adaptive proposal - initialized with reasonable defaults */
     AdaptiveProposal ap = {
         .drift_std = PMMH_INIT_DRIFT_STD,
@@ -454,7 +427,7 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
     for (int iter = 0; iter < n_iterations; iter++)
     {
         /* Generate proposal noise */
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->streams[tid],
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->stream,
                       3, prop_noise, 0.0, 1.0);
 
         /* Propose new parameters using adaptive scales */
@@ -485,7 +458,7 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
 
         /* MH accept/reject */
         double u;
-        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->streams[tid], 1, &u, 0.0, 1.0);
+        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->stream, 1, &u, 0.0, 1.0);
 
         int accepted = (log(u) < log_alpha);
         if (accepted)
@@ -579,8 +552,6 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
     (void)n_particles; /* Silence unused warning */
     (void)theta_vol;
 
-    int tid = omp_get_thread_num();
-
     /* Adaptive proposal - initialized with reasonable defaults */
     AdaptiveProposal ap = {
         .drift_std = PMMH_INIT_DRIFT_STD,
@@ -609,7 +580,7 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
     for (int iter = 0; iter < n_iterations; iter++)
     {
         /* Generate proposal noise */
-        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->streams[tid],
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->stream,
                       3, prop_noise, 0.0, 1.0);
 
         /* Propose new parameters using adaptive scales */
@@ -640,7 +611,7 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
 
         /* MH accept/reject */
         double u;
-        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->streams[tid], 1, &u, 0.0, 1.0);
+        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->stream, 1, &u, 0.0, 1.0);
 
         int accepted = (log(u) < log_alpha);
         if (accepted)
