@@ -422,6 +422,29 @@ if(UNIX)
     target_link_libraries(bench_pmmh_scalar PRIVATE m)
 endif()
 
+# PMMH tuning benchmark - find optimal particles/iterations
+add_executable(tune_pmmh
+    test/tune_pmmh.c
+)
+
+target_compile_options(tune_pmmh PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O3 -march=native>
+)
+
+target_compile_definitions(tune_pmmh PRIVATE HAS_MKL)
+target_include_directories(tune_pmmh PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/2D
+)
+target_link_libraries(tune_pmmh PRIVATE
+    MKL::MKL
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:OpenMP::OpenMP_C>
+)
+
+if(UNIX)
+    target_link_libraries(tune_pmmh PRIVATE m pthread dl)
+endif()
+
 #───────────────────────────────────────────────────────────────────────────────
 # Install
 #───────────────────────────────────────────────────────────────────────────────
