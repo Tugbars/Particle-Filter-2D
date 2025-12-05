@@ -45,8 +45,8 @@
  *============================================================================*/
 
 #define PMMH_N_PARTICLES 256
-#define PMMH_N_ITERATIONS 400
-#define PMMH_N_BURNIN 150
+#define PMMH_N_ITERATIONS 300
+#define PMMH_N_BURNIN 100
 #define PMMH_CACHE_LINE 64
 
 /* Align allocations for SIMD */
@@ -111,12 +111,10 @@ static PMMHState *pmmh_state_create(int n_particles, double theta_vol)
     s->n_particles = n_particles;
     s->theta_vol = theta_vol;
 
-    /* Arena allocation: single contiguous block for all particle arrays
-     * Benefits: Better dTLB hit rates, prefetching, reduced heap fragmentation */
-    size_t d_size = ((n_particles * sizeof(double) + PMMH_CACHE_LINE - 1) / PMMH_CACHE_LINE) * PMMH_CACHE_LINE; /* Align each array */
+    /* Arena allocation: single contiguous block for all particle arrays */
+    size_t d_size = ((n_particles * sizeof(double) + PMMH_CACHE_LINE - 1) / PMMH_CACHE_LINE) * PMMH_CACHE_LINE;
     size_t i_size = ((n_particles * sizeof(int) + PMMH_CACHE_LINE - 1) / PMMH_CACHE_LINE) * PMMH_CACHE_LINE;
 
-    /* 6 double arrays + 1 int array */
     size_t total_size = 6 * d_size + i_size;
 
     char *arena = (char *)mkl_malloc(total_size, PMMH_CACHE_LINE);
@@ -138,12 +136,8 @@ static void pmmh_state_destroy(PMMHState *s)
 {
     if (!s)
         return;
-
     vslDeleteStream(&s->stream);
-
-    /* Single free for arena (log_vol is base pointer) */
     mkl_free(s->log_vol);
-
     ALIGNED_FREE(s);
 }
 
@@ -155,15 +149,6 @@ static void pmmh_state_seed(PMMHState *s, unsigned int seed)
 
 /*============================================================================
  * VECTORIZED PARTICLE FILTER LOG-LIKELIHOOD
- *
- * Optimizations applied:
- *   1. Single SFMT19937 RNG per state (not per-thread array)
- *   2. ICDF method for Gaussian generation
- *   3. vdExp for vectorized exp
- *   4. Reciprocal multiplication instead of division
- *   5. SIMD loops with #pragma omp simd
- *   6. Precomputed CDF for resampling (forced to 1.0 endpoint)
- *   7. Direct gather (no temp buffer - disjoint arrays)
  *============================================================================*/
 
 static double pmmh_log_likelihood_mkl(PMMHState *s,
@@ -202,13 +187,13 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
         /* Vectorized exp for volatility */
         vdExp(np, s->log_vol_new, s->weights_exp);
 
-        /* Compute log-weights using reciprocal (avoid division) */
+        /* Compute log-weights */
         double max_log_w = -DBL_MAX;
 #pragma omp simd reduction(max : max_log_w)
         for (int i = 0; i < np; i++)
         {
             double vol = s->weights_exp[i];
-            double inv_vol = 1.0 / vol; /* Reciprocal - faster than division in loop */
+            double inv_vol = 1.0 / vol;
             double z = ret_minus_drift * inv_vol;
             double log_w = -0.5 * z * z - s->log_vol_new[i];
             s->weights[i] = log_w;
@@ -216,17 +201,14 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
                 max_log_w = log_w;
         }
 
-/* Normalize weights (subtract max for stability) */
 #pragma omp simd
         for (int i = 0; i < np; i++)
         {
             s->weights[i] -= max_log_w;
         }
 
-        /* Vectorized exp for normalized weights */
         vdExp(np, s->weights, s->weights_exp);
 
-        /* Sum weights */
         double sum_w = 0.0;
 #pragma omp simd reduction(+ : sum_w)
         for (int i = 0; i < np; i++)
@@ -236,7 +218,6 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
 
         total_log_lik += max_log_w + log(sum_w / np);
 
-        /* Normalize weights */
         double inv_sum = 1.0 / sum_w;
 #pragma omp simd
         for (int i = 0; i < np; i++)
@@ -244,41 +225,30 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
             s->weights_exp[i] *= inv_sum;
         }
 
-        /* Always resample (adaptive resampling was causing accuracy issues) */
+        /* Systematic resampling */
         {
-            /* Build CDF in-place (reuse uniform buffer) */
             double *cdf = s->uniform;
             cdf[0] = s->weights_exp[0];
             for (int i = 1; i < np; i++)
             {
                 cdf[i] = cdf[i - 1] + s->weights_exp[i];
             }
-            /* Force CDF to end at exactly 1.0 (avoid float accumulation errors) */
             cdf[np - 1] = 1.0;
 
-            /* Generate single uniform */
             double u0;
-            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->stream,
-                         1, &u0, 0.0, 1.0);
+            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->stream, 1, &u0, 0.0, 1.0);
             double inv_np = 1.0 / np;
             u0 *= inv_np;
 
-            /* Systematic resampling with linear scan
-             * Since targets are sorted and CDF is monotonic, j only increases */
             int j = 0;
             for (int i = 0; i < np; i++)
             {
                 double target = u0 + i * inv_np;
-                /* Advance j until CDF[j] >= target */
                 while (j < np - 1 && cdf[j] < target)
-                {
                     j++;
-                }
                 s->ancestors[i] = j;
             }
 
-/* Direct gather - no temp buffer needed because log_vol and
- * log_vol_new are disjoint regions in the arena */
 #pragma omp simd
             for (int i = 0; i < np; i++)
             {
@@ -297,31 +267,23 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
 static double pmmh_log_prior(const PMMHParams *p, const PMMHPrior *prior)
 {
     double lp = 0.0;
-
-    /* Gaussian priors */
     double z_drift = (p->drift - prior->mean.drift) / prior->std.drift;
     double z_mu = (p->mu_vol - prior->mean.mu_vol) / prior->std.mu_vol;
     double z_sigma = (log(p->sigma_vol) - log(prior->mean.sigma_vol)) / prior->std.sigma_vol;
-
     lp -= 0.5 * (z_drift * z_drift + z_mu * z_mu + z_sigma * z_sigma);
     lp -= log(prior->std.drift) + log(prior->std.mu_vol) + log(prior->std.sigma_vol);
-    lp -= log(p->sigma_vol); /* Jacobian for log-normal */
-
+    lp -= log(p->sigma_vol);
     return lp;
 }
 
 /*============================================================================
  * ADAPTIVE PROPOSAL TUNING
- *
- * Target acceptance rate: 23-25% for 3 parameters (Roberts & Rosenthal)
- * Adapt during burnin only to maintain ergodicity
  *============================================================================*/
 
-#define PMMH_ADAPT_WINDOW 50    /* Samples before adapting */
-#define PMMH_TARGET_ACCEPT 0.25 /* Target 25% - optimal for 3 params */
-#define PMMH_ACCEPT_TOL 0.05    /* Tight tolerance */
+#define PMMH_ADAPT_WINDOW 50
+#define PMMH_TARGET_ACCEPT 0.30
+#define PMMH_ACCEPT_TOL 0.05
 
-/* Initial proposal scales - larger for better exploration */
 #define PMMH_INIT_DRIFT_STD 0.0015
 #define PMMH_INIT_MU_STD 0.25
 #define PMMH_INIT_SIGMA_LOG_STD 0.15
@@ -341,27 +303,24 @@ static inline void adapt_proposal(AdaptiveProposal *ap)
         return;
 
     double rate = (double)ap->window_accepts / ap->window_total;
-
-    /* Scale factor: decrease if accepting too little, increase if too much */
     double factor;
     if (rate < PMMH_TARGET_ACCEPT - PMMH_ACCEPT_TOL)
     {
-        factor = 0.8; /* Accepting too little → smaller proposals */
+        factor = 0.8;
     }
     else if (rate > PMMH_TARGET_ACCEPT + PMMH_ACCEPT_TOL)
     {
-        factor = 1.25; /* Accepting too much → larger proposals */
+        factor = 1.25;
     }
     else
     {
-        factor = 1.0; /* In target range */
+        factor = 1.0;
     }
 
     ap->drift_std *= factor;
     ap->mu_std *= factor;
     ap->sigma_log_std *= factor;
 
-    /* Clamp to reasonable bounds */
     if (ap->drift_std < 1e-6)
         ap->drift_std = 1e-6;
     if (ap->drift_std > 0.01)
@@ -375,13 +334,12 @@ static inline void adapt_proposal(AdaptiveProposal *ap)
     if (ap->sigma_log_std > 0.5)
         ap->sigma_log_std = 0.5;
 
-    /* Reset window */
     ap->window_accepts = 0;
     ap->window_total = 0;
 }
 
 /*============================================================================
- * MAIN PMMH SAMPLER (with CPM + Adaptive Proposals)
+ * MAIN PMMH SAMPLER
  *============================================================================*/
 
 static void pmmh_run_mkl(const double *returns, int n_obs,
@@ -395,11 +353,9 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
 
     double t_start = omp_get_wtime();
 
-    /* Create state with specific seed */
     PMMHState *state = pmmh_state_create(n_particles, theta_vol);
     pmmh_state_seed(state, seed);
 
-    /* Adaptive proposal - initialized with reasonable defaults */
     AdaptiveProposal ap = {
         .drift_std = PMMH_INIT_DRIFT_STD,
         .mu_std = PMMH_INIT_MU_STD,
@@ -407,7 +363,6 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
         .window_accepts = 0,
         .window_total = 0};
 
-    /* Sample storage */
     int max_samples = n_iterations - n_burnin;
     double *samples_drift = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
     double *samples_mu = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
@@ -416,27 +371,22 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
     int n_accepted = 0;
     int sample_idx = 0;
 
-    /* Initialize chain at prior mean */
     PMMHParams current = prior->mean;
     double current_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &current);
     double current_lp = pmmh_log_prior(&current, prior);
 
-    /* Proposal noise buffer */
     double prop_noise[3];
 
     for (int iter = 0; iter < n_iterations; iter++)
     {
-        /* Generate proposal noise */
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->stream,
                       3, prop_noise, 0.0, 1.0);
 
-        /* Propose new parameters using adaptive scales */
         PMMHParams proposed;
         proposed.drift = current.drift + prop_noise[0] * ap.drift_std;
         proposed.mu_vol = current.mu_vol + prop_noise[1] * ap.mu_std;
         proposed.sigma_vol = current.sigma_vol * exp(prop_noise[2] * ap.sigma_log_std);
 
-        /* Clamp to bounds */
         if (proposed.drift < -0.01)
             proposed.drift = -0.01;
         if (proposed.drift > 0.01)
@@ -450,13 +400,11 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
         if (proposed.sigma_vol > 0.5)
             proposed.sigma_vol = 0.5;
 
-        /* Compute acceptance ratio */
         double prop_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &proposed);
         double prop_lp = pmmh_log_prior(&proposed, prior);
 
         double log_alpha = (prop_ll + prop_lp) - (current_ll + current_lp);
 
-        /* MH accept/reject */
         double u;
         vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->stream, 1, &u, 0.0, 1.0);
 
@@ -469,17 +417,14 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
             n_accepted++;
         }
 
-        /* Track acceptance for adaptation */
         ap.window_accepts += accepted;
         ap.window_total++;
 
-        /* Adapt proposal during burnin only */
         if (iter < n_burnin)
         {
             adapt_proposal(&ap);
         }
 
-        /* Store sample after burnin */
         if (iter >= n_burnin)
         {
             samples_drift[sample_idx] = current.drift;
@@ -489,10 +434,8 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
         }
     }
 
-    /* Compute posterior statistics using SIMD reductions */
     result->n_samples = sample_idx;
 
-    /* Mean and sum of squares in single pass */
     double sum_drift = 0, sum_mu = 0, sum_sigma = 0;
     double sum_sq_drift = 0, sum_sq_mu = 0, sum_sq_sigma = 0;
 
@@ -515,7 +458,6 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
     result->posterior_mean.mu_vol = sum_mu * inv_n;
     result->posterior_mean.sigma_vol = sum_sigma * inv_n;
 
-    /* Std = sqrt(E[x²] - E[x]²) */
     result->posterior_std.drift = sqrt(sum_sq_drift * inv_n -
                                        result->posterior_mean.drift * result->posterior_mean.drift);
     result->posterior_std.mu_vol = sqrt(sum_sq_mu * inv_n -
@@ -526,7 +468,6 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
     result->acceptance_rate = (double)n_accepted / n_iterations;
     result->elapsed_ms = (omp_get_wtime() - t_start) * 1000.0;
 
-    /* Cleanup */
     ALIGNED_FREE(samples_drift);
     ALIGNED_FREE(samples_mu);
     ALIGNED_FREE(samples_sigma);
@@ -535,8 +476,6 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
 
 /*============================================================================
  * PMMH WITH EXTERNALLY MANAGED STATE
- *
- * For parallel chains: reuse states to avoid vslNewStream overhead
  *============================================================================*/
 
 static void pmmh_run_mkl_with_state(PMMHState *state,
@@ -548,11 +487,8 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
 {
 
     double t_start = omp_get_wtime();
-    const int n_particles = state->n_particles;
-    (void)n_particles; /* Silence unused warning */
     (void)theta_vol;
 
-    /* Adaptive proposal - initialized with reasonable defaults */
     AdaptiveProposal ap = {
         .drift_std = PMMH_INIT_DRIFT_STD,
         .mu_std = PMMH_INIT_MU_STD,
@@ -560,7 +496,6 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
         .window_accepts = 0,
         .window_total = 0};
 
-    /* Sample storage */
     int max_samples = n_iterations - n_burnin;
     double *samples_drift = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
     double *samples_mu = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
@@ -569,27 +504,22 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
     int n_accepted = 0;
     int sample_idx = 0;
 
-    /* Initialize chain at prior mean */
     PMMHParams current = prior->mean;
     double current_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &current);
     double current_lp = pmmh_log_prior(&current, prior);
 
-    /* Proposal noise buffer */
     double prop_noise[3];
 
     for (int iter = 0; iter < n_iterations; iter++)
     {
-        /* Generate proposal noise */
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->stream,
                       3, prop_noise, 0.0, 1.0);
 
-        /* Propose new parameters using adaptive scales */
         PMMHParams proposed;
         proposed.drift = current.drift + prop_noise[0] * ap.drift_std;
         proposed.mu_vol = current.mu_vol + prop_noise[1] * ap.mu_std;
         proposed.sigma_vol = current.sigma_vol * exp(prop_noise[2] * ap.sigma_log_std);
 
-        /* Clamp to bounds */
         if (proposed.drift < -0.01)
             proposed.drift = -0.01;
         if (proposed.drift > 0.01)
@@ -603,13 +533,11 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
         if (proposed.sigma_vol > 0.5)
             proposed.sigma_vol = 0.5;
 
-        /* Compute acceptance ratio */
         double prop_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &proposed);
         double prop_lp = pmmh_log_prior(&proposed, prior);
 
         double log_alpha = (prop_ll + prop_lp) - (current_ll + current_lp);
 
-        /* MH accept/reject */
         double u;
         vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->stream, 1, &u, 0.0, 1.0);
 
@@ -622,17 +550,14 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
             n_accepted++;
         }
 
-        /* Track acceptance for adaptation */
         ap.window_accepts += accepted;
         ap.window_total++;
 
-        /* Adapt proposal during burnin only */
         if (iter < n_burnin)
         {
             adapt_proposal(&ap);
         }
 
-        /* Store sample after burnin */
         if (iter >= n_burnin)
         {
             samples_drift[sample_idx] = current.drift;
@@ -642,7 +567,6 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
         }
     }
 
-    /* Compute posterior statistics using SIMD reductions */
     result->n_samples = sample_idx;
 
     double sum_drift = 0, sum_mu = 0, sum_sigma = 0;
@@ -677,21 +601,18 @@ static void pmmh_run_mkl_with_state(PMMHState *state,
     result->acceptance_rate = (double)n_accepted / n_iterations;
     result->elapsed_ms = (omp_get_wtime() - t_start) * 1000.0;
 
-    /* Cleanup sample storage only (state is external) */
     ALIGNED_FREE(samples_drift);
     ALIGNED_FREE(samples_mu);
     ALIGNED_FREE(samples_sigma);
 }
 
 /*============================================================================
- * PARALLEL MONTE CARLO - RUN MULTIPLE CHAINS
- *
- * Optimization: Pre-allocate states per-thread to avoid vslNewStream overhead
+ * PARALLEL MONTE CARLO
  *============================================================================*/
 
 typedef struct
 {
-    PMMHResult *results; /* [n_chains] */
+    PMMHResult *results;
     int n_chains;
     double total_elapsed_ms;
 } PMMHParallelResult;
@@ -710,7 +631,6 @@ static void pmmh_run_parallel(const double *returns, int n_obs,
     result->n_chains = n_chains;
     result->results = (PMMHResult *)malloc(n_chains * sizeof(PMMHResult));
 
-    /* Pre-allocate one state per thread to avoid vslNewStream overhead */
     int n_threads = omp_get_max_threads();
     PMMHState **thread_states = (PMMHState **)malloc(n_threads * sizeof(PMMHState *));
 
@@ -719,22 +639,18 @@ static void pmmh_run_parallel(const double *returns, int n_obs,
         thread_states[t] = pmmh_state_create(n_particles, theta_vol);
     }
 
-/* Run chains in parallel, reusing thread-local states */
 #pragma omp parallel for schedule(dynamic)
     for (int chain = 0; chain < n_chains; chain++)
     {
         int tid = omp_get_thread_num();
         PMMHState *state = thread_states[tid];
 
-        /* Seed state for this specific chain */
         pmmh_state_seed(state, 12345 + chain * 104729);
 
-        /* Run PMMH with pre-allocated state */
         pmmh_run_mkl_with_state(state, returns, n_obs, prior, theta_vol,
                                 n_iterations, n_burnin, &result->results[chain]);
     }
 
-    /* Cleanup thread states */
     for (int t = 0; t < n_threads; t++)
     {
         pmmh_state_destroy(thread_states[t]);
@@ -746,7 +662,6 @@ static void pmmh_run_parallel(const double *returns, int n_obs,
 
 static void pmmh_parallel_aggregate(const PMMHParallelResult *pr, PMMHResult *agg)
 {
-    /* Aggregate results across chains */
     double sum_drift = 0, sum_mu = 0, sum_sigma = 0;
     double sum_acc = 0;
     int total_samples = 0;
@@ -767,7 +682,6 @@ static void pmmh_parallel_aggregate(const PMMHParallelResult *pr, PMMHResult *ag
     agg->n_samples = total_samples;
     agg->elapsed_ms = pr->total_elapsed_ms;
 
-    /* Compute cross-chain std (simplified) */
     double var_drift = 0, var_mu = 0, var_sigma = 0;
     for (int i = 0; i < pr->n_chains; i++)
     {
