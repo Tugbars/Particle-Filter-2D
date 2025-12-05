@@ -10,7 +10,6 @@
 #include <omp.h>
 #include "mkl_config.h"
 
-
 /* alloca: MSVC uses _alloca from malloc.h, others use alloca.h */
 #ifdef _MSC_VER
 #include <malloc.h>
@@ -25,14 +24,24 @@
 #define PF2D_HAS_AVX 0
 #endif
 
+/*============================================================================
+ * FIX #3: Cache-line padded accumulator to prevent false sharing
+ *============================================================================*/
+#define PF2D_CACHE_LINE 64
+
+typedef struct
+{
+    pf2d_real value;
+    char pad[PF2D_CACHE_LINE - sizeof(pf2d_real)];
+} pf2d_padded_real;
 
 /*============================================================================
  * HELPERS
  *============================================================================*/
 
- /**
+/**
  * @brief AVX2 vectorized fill - 4 doubles per store vs 1
- * 
+ *
  * Used for weight reset after resampling.
  * Arrays are 64-byte aligned from mkl_malloc.
  */
@@ -40,14 +49,14 @@ static inline void pf2d_fill_constant(pf2d_real *arr, int n, pf2d_real val)
 {
 #if PF2D_HAS_AVX
     int i = 0;
-    
-#if PF2D_REAL_SIZE == 8  /* double */
+
+#if PF2D_REAL_SIZE == 8 /* double */
     __m256d v_val = _mm256_set1_pd(val);
     for (; i <= n - 4; i += 4)
     {
         _mm256_store_pd(&arr[i], v_val);
     }
-#else  /* float */
+#else /* float */
     __m256 v_val = _mm256_set1_ps(val);
     for (; i <= n - 8; i += 8)
     {
@@ -254,12 +263,14 @@ PF2D *pf2d_create(int n_particles, int n_regimes)
     pf->regimes_tmp = aligned_alloc_int(n_particles);
     pf->scratch1 = aligned_alloc_real(n_particles);
     pf->scratch2 = aligned_alloc_real(n_particles);
-    pf->indices = aligned_alloc_int(n_particles); /* Proper int buffer */
+    pf->regime_uniform = aligned_alloc_real(n_particles); /* FIX #1: dedicated buffer */
+    pf->indices = aligned_alloc_int(n_particles);         /* Proper int buffer */
+    pf->resample_count = aligned_alloc_int(n_particles);  /* Residual resampling */
 
     if (!pf->prices || !pf->prices_tmp || !pf->log_vols || !pf->log_vols_tmp ||
         !pf->weights || !pf->log_weights || !pf->cumsum ||
         !pf->regimes || !pf->regimes_tmp || !pf->scratch1 || !pf->scratch2 ||
-        !pf->indices)
+        !pf->regime_uniform || !pf->indices || !pf->resample_count)
     {
         pf2d_destroy(pf);
         return NULL;
@@ -299,6 +310,14 @@ PF2D *pf2d_create(int n_particles, int n_regimes)
     pf->vol_ema = 0.01;
     pf->vol_baseline = 0.01;
 
+    /* Resampling method defaults */
+    pf->resample_method = PF2D_RESAMPLE_SYSTEMATIC; /* Classic default */
+    pf->reg_bandwidth_price = (pf2d_real)0.0001;    /* ~1 tick for typical prices */
+    pf->reg_bandwidth_vol = (pf2d_real)0.02;        /* ~2% log-vol jitter */
+    pf->reg_scale_min = (pf2d_real)0.1;             /* Low jitter when healthy */
+    pf->reg_scale_max = (pf2d_real)0.6;             /* More jitter when degenerate */
+    pf->last_ess = (pf2d_real)n_particles;          /* Initialize to max */
+
     /* Uniform initial weights */
     for (int i = 0; i < n_particles; i++)
     {
@@ -307,6 +326,9 @@ PF2D *pf2d_create(int n_particles, int n_regimes)
 
     /* Initialize regime LUT */
     memset(pf->regime_lut, 0, PF2D_REGIME_LUT_SIZE);
+
+    /* Initialize adaptive self-calibration */
+    pf2d_adaptive_init(pf);
 
     return pf;
 }
@@ -333,7 +355,9 @@ void pf2d_destroy(PF2D *pf)
     mkl_free(pf->regimes_tmp);
     mkl_free(pf->scratch1);
     mkl_free(pf->scratch2);
+    mkl_free(pf->regime_uniform);
     mkl_free(pf->indices);
+    mkl_free(pf->resample_count);
     mkl_free(pf);
 }
 
@@ -429,6 +453,27 @@ void pf2d_set_resample_adaptive(PF2D *pf, pf2d_real baseline_vol)
 }
 
 /*============================================================================
+ * RESAMPLING METHOD CONFIGURATION
+ *============================================================================*/
+
+void pf2d_set_resample_method(PF2D *pf, PF2DResampleMethod method)
+{
+    pf->resample_method = method;
+}
+
+void pf2d_set_regularization_bandwidth(PF2D *pf, pf2d_real h_price, pf2d_real h_vol)
+{
+    pf->reg_bandwidth_price = h_price;
+    pf->reg_bandwidth_vol = h_vol;
+}
+
+void pf2d_set_regularization_scaling(PF2D *pf, pf2d_real scale_min, pf2d_real scale_max)
+{
+    pf->reg_scale_min = scale_min;
+    pf->reg_scale_max = scale_max;
+}
+
+/*============================================================================
  * INITIALIZE
  *============================================================================*/
 
@@ -512,6 +557,9 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
 
                 const PF2DRegimeParams *p = &params[r];
 
+                /* Apply adaptive σ_vol scaling */
+                pf2d_real effective_sigma_vol = p->sigma_vol * pf->adaptive.sigma_vol_scale;
+
                 /* Generate correlated noise */
                 pf2d_real z1 = pf2d_pcg32_gaussian(rng);
                 pf2d_real z2 = pf2d_pcg32_gaussian(rng);
@@ -530,7 +578,7 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
                 price = price + p->drift + vol * noise_price;
 
                 /* Log-vol dynamics: lv = (1-θ)*lv + θ*μ + σ_v*noise */
-                lv = p->one_minus_theta * lv + p->theta_mu + p->sigma_vol * noise_vol;
+                lv = p->one_minus_theta * lv + p->theta_mu + effective_sigma_vol * noise_vol;
 
                 prices[i] = price;
                 log_vols[i] = lv;
@@ -542,6 +590,7 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
         /* MKL: bulk RNG then propagate */
         pf2d_real *noise1 = pf->scratch1;
         pf2d_real *noise2 = pf->scratch2;
+        pf2d_real *uniform = pf->regime_uniform; /* FIX #1: dedicated buffer */
 
 #pragma omp parallel
         {
@@ -556,16 +605,15 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
 
             if (len > 0)
             {
+                /* FIX #2: All RNG uses thread-local streams */
                 pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                                  len, &noise1[start], 0.0, 1.0);
                 pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                                  len, &noise2[start], 0.0, 1.0);
+                pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[tid],
+                                len, &uniform[start], 0.0, 1.0);
             }
         }
-
-        /* Need uniform for regime sampling */
-        pf2d_real *uniform = pf->log_weights; /* Reuse buffer temporarily */
-        pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[0], n, uniform, 0.0, 1.0);
 
 #pragma omp parallel
         {
@@ -579,6 +627,9 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
 
                 const PF2DRegimeParams *p = &params[r];
 
+                /* Apply adaptive σ_vol scaling */
+                pf2d_real effective_sigma_vol = p->sigma_vol * pf->adaptive.sigma_vol_scale;
+
                 pf2d_real z1 = noise1[i];
                 pf2d_real z2 = noise2[i];
                 pf2d_real noise_price = z1;
@@ -589,7 +640,7 @@ void pf2d_propagate(PF2D *pf, const PF2DRegimeProbs *rp)
                 pf2d_real vol = (pf2d_real)exp((double)lv);
 
                 price = price + p->drift + vol * noise_price;
-                lv = p->one_minus_theta * lv + p->theta_mu + p->sigma_vol * noise_vol;
+                lv = p->one_minus_theta * lv + p->theta_mu + effective_sigma_vol * noise_vol;
 
                 prices[i] = price;
                 log_vols[i] = lv;
@@ -623,7 +674,7 @@ static void pf2d_propagate_vectorized(PF2D *pf)
     pf2d_real *vols = pf->prices_tmp; /* Reuse as vol buffer */
     pf2d_real *z1 = pf->scratch1;
     pf2d_real *z2 = pf->scratch2;
-    pf2d_real *u_reg = pf->log_weights; /* Reuse temporarily */
+    pf2d_real *u_reg = pf->regime_uniform; /* FIX #1: dedicated buffer */
     int *regs = pf->regimes;
 
     const uint8_t *lut = pf->regime_lut;
@@ -659,6 +710,7 @@ static void pf2d_propagate_vectorized(PF2D *pf)
 #pragma omp parallel
     {
         int i;
+        pf2d_real sigma_scale = pf->adaptive.sigma_vol_scale;
 #pragma omp for schedule(static)
         for (i = 0; i < n; i++)
         {
@@ -668,13 +720,16 @@ static void pf2d_propagate_vectorized(PF2D *pf)
 
             PF2DRegimeParams p = params[r];
 
+            /* Apply adaptive σ_vol scaling */
+            pf2d_real effective_sigma_vol = p.sigma_vol * sigma_scale;
+
             pf2d_real eps_p = z1[i];
             pf2d_real eps_v = p.rho * z1[i] + p.sqrt_one_minus_rho_sq * z2[i];
 
             prices[i] += p.drift + vols[i] * eps_p;
             log_vols[i] = p.one_minus_theta * log_vols[i] +
                           p.theta_mu +
-                          p.sigma_vol * eps_v;
+                          effective_sigma_vol * eps_v;
         }
     }
 }
@@ -703,33 +758,30 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
     pf2d_real *vols = pf->prices_tmp;      /* Reuse tmp buffer for volatilities */
     pf2d_real *z1 = pf->scratch1;          /* Gaussian noise for price */
     pf2d_real *z2 = pf->scratch2;          /* Gaussian noise for volatility */
-    pf2d_real *lw = pf->log_weights;       /* Log-weights, also temp for uniform RNG */
+    pf2d_real *u_reg = pf->regime_uniform; /* FIX #1: dedicated buffer for regime uniforms */
+    pf2d_real *lw = pf->log_weights;       /* Log-weights output */
     pf2d_real *w = pf->weights;
     int *regs = pf->regimes;
 
-    const uint8_t *lut = pf->regime_lut;   /* Pre-built lookup table: uniform → regime */
+    const uint8_t *lut = pf->regime_lut; /* Pre-built lookup table: uniform → regime */
     const PF2DRegimeParams *params = pf->regimes_params;
-    pf2d_real nhiv = pf->neg_half_inv_var; /* -0.5 / obs_variance, precomputed */
+    pf2d_real nhiv = pf->neg_half_inv_var;                /* -0.5 / obs_variance, precomputed */
+    pf2d_real sigma_scale = pf->adaptive.sigma_vol_scale; /* Adaptive σ_vol scaling */
 
     /* 1. Pre-compute vol = exp(log_vol) for ALL particles
      *    MKL vExp is heavily optimized (AVX2 vectorized, threaded for large N).
      *    Better to call once than per-particle exp() in loop. */
     pf2d_vExp(n, log_vols, vols);
 
-    /* 2. Allocate thread-local max accumulators on stack
-     *    Using alloca avoids heap allocation in hot path.
-     *    Array size = num_threads (16), tiny overhead. */
+    /* 2. FIX #3: Cache-line padded accumulators to prevent false sharing
+     *    Each thread writes to its own cache line. */
     int nt = omp_get_max_threads();
-#ifdef _MSC_VER
-    pf2d_real *partial_max = (pf2d_real *)_alloca(nt * sizeof(pf2d_real));
-#else
-    pf2d_real *partial_max = (pf2d_real *)alloca(nt * sizeof(pf2d_real));
-#endif
+    pf2d_padded_real partial_max[PF2D_MAX_THREADS];
 
     /* Initialize to -inf so any real log-weight will be larger */
     for (int t = 0; t < nt; t++)
     {
-        partial_max[t] = (pf2d_real)(-1e30);
+        partial_max[t].value = (pf2d_real)(-1e30);
     }
 
     /* 3. BLOCK-PROCESSED parallel region
@@ -739,13 +791,14 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
     {
         int tid = omp_get_thread_num();
         int num_threads = omp_get_num_threads();
-        
+
         /* Static partitioning: each thread gets N/num_threads particles */
         int particles_per_thread = (n + num_threads - 1) / num_threads;
         int thread_start = tid * particles_per_thread;
         int thread_end = thread_start + particles_per_thread;
-        if (thread_end > n) thread_end = n;
-        
+        if (thread_end > n)
+            thread_end = n;
+
         /* Thread-local max - no synchronization needed during accumulation */
         pf2d_real local_max = (pf2d_real)(-1e30);
 
@@ -753,22 +806,23 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
         for (int block_start = thread_start; block_start < thread_end; block_start += PF2D_BLOCK_SIZE)
         {
             int block_end = block_start + PF2D_BLOCK_SIZE;
-            if (block_end > thread_end) block_end = thread_end;
+            if (block_end > thread_end)
+                block_end = thread_end;
             int block_len = block_end - block_start;
 
             /* === RNG PHASE ===
              * Generate random numbers for this block only.
              * Data lands in L2 cache, will be consumed immediately below.
-             * 
+             *
              * Each thread has its own MKL stream (pf->mkl_rng[tid]) - no contention.
              * SFMT19937 is fast and has good statistical properties. */
             pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              block_len, &z1[block_start], 0.0, 1.0);
             pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[tid],
                              block_len, &z2[block_start], 0.0, 1.0);
-            /* Uniform for regime sampling - temporarily stored in lw[] */
+            /* FIX #1: Uniform for regime sampling - now uses dedicated buffer */
             pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[tid],
-                            block_len, &lw[block_start], 0.0, 1.0);
+                            block_len, &u_reg[block_start], 0.0, 1.0);
 
             /* === PHYSICS + LIKELIHOOD PHASE ===
              * Process same block while data is still in L2 cache.
@@ -778,12 +832,15 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
                 /* --- Regime Selection ---
                  * Convert uniform random to regime via precomputed LUT.
                  * LUT avoids branches and cumulative probability search. */
-                int lut_idx = (int)(lw[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
+                int lut_idx = (int)(u_reg[i] * (pf2d_real)(PF2D_REGIME_LUT_SIZE - 1));
                 int r = lut[lut_idx];
                 regs[i] = r;
 
                 /* Copy regime params to local (compiler may optimize to registers) */
                 PF2DRegimeParams p = params[r];
+
+                /* Apply adaptive σ_vol scaling */
+                pf2d_real effective_sigma_vol = p.sigma_vol * sigma_scale;
 
                 /* --- Correlated Noise Generation ---
                  * eps_p: noise for price equation
@@ -802,7 +859,7 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
                  *   log_vol[t+1] = (1-θ)*log_vol[t] + θ*μ + σ_v*eps_v
                  * Mean-reverts to μ with speed θ, diffusion σ_v */
                 log_vols[i] = p.one_minus_theta * log_vols[i] +
-                              p.theta_mu + p.sigma_vol * eps_v;
+                              p.theta_mu + effective_sigma_vol * eps_v;
 
                 /* --- Log-Likelihood (Gaussian observation model) ---
                  *   log p(obs | price) = -0.5 * (obs - price)² / var
@@ -818,26 +875,26 @@ static void pf2d_propagate_and_weight_fused(PF2D *pf, pf2d_real observation)
         }
 
         /* Store thread's max for later reduction */
-        partial_max[tid] = local_max;
+        partial_max[tid].value = local_max;
     }
 
     /* 4. Serial max reduction
      *    Only nt elements (16), not worth parallelizing.
      *    Could use atomic or reduction clause, but serial is faster here. */
-    pf2d_real max_lw = partial_max[0];
+    pf2d_real max_lw = partial_max[0].value;
     for (int t = 1; t < nt; t++)
     {
-        if (partial_max[t] > max_lw)
-            max_lw = partial_max[t];
+        if (partial_max[t].value > max_lw)
+            max_lw = partial_max[t].value;
     }
 
     /* 5. Normalize weights (log-sum-exp trick for numerical stability)
-     *    
+     *
      *    Problem: exp(log_weight) can overflow/underflow
      *    Solution: w[i] = exp(lw[i] - max_lw) / sum(exp(lw - max_lw))
-     *    
+     *
      *    Mathematically equivalent, but keeps values in reasonable range. */
-    
+
     /* 5a. Subtract max (shifts all log-weights so max becomes 0) */
     {
         int i;
@@ -880,14 +937,8 @@ static void pf2d_update_weights_vectorized(PF2D *pf, pf2d_real observation)
     pf2d_real *w = pf->weights;
 
     /* 1. Fused: compute log-likelihoods AND find max in single pass
-     *    Use partial_max array to avoid slow critical section.
-     *    MSVC OpenMP 2.0 doesn't support reduction(max:). */
-    int nt = omp_get_max_threads();
-#ifdef _MSC_VER
-    pf2d_real *partial_max = (pf2d_real *)_alloca(nt * sizeof(pf2d_real));
-#else
-    pf2d_real *partial_max = (pf2d_real *)alloca(nt * sizeof(pf2d_real));
-#endif
+     *    FIX #3: Use padded array to avoid false sharing. */
+    pf2d_padded_real partial_max[PF2D_MAX_THREADS];
 
 #pragma omp parallel
     {
@@ -904,15 +955,15 @@ static void pf2d_update_weights_vectorized(PF2D *pf, pf2d_real observation)
             if (val > local_max)
                 local_max = val;
         }
-        partial_max[tid] = local_max;
+        partial_max[tid].value = local_max;
     }
 
     /* Serial reduction of partial maxes */
-    pf2d_real max_lw = partial_max[0];
-    for (int t = 1; t < nt; t++)
+    pf2d_real max_lw = partial_max[0].value;
+    for (int t = 1; t < omp_get_max_threads(); t++)
     {
-        if (partial_max[t] > max_lw)
-            max_lw = partial_max[t];
+        if (partial_max[t].value > max_lw)
+            max_lw = partial_max[t].value;
     }
 
 /* 2. Subtract max for numerical stability */
@@ -1069,17 +1120,22 @@ pf2d_real pf2d_effective_sample_size(const PF2D *pf)
  * RESAMPLE
  *============================================================================*/
 
-void pf2d_resample(PF2D *pf)
+/**
+ * @brief Core systematic resampling (internal helper)
+ *
+ * Populates indices[] with parent indices using systematic resampling.
+ * Does NOT do the gather or pointer swap - caller handles that.
+ */
+static void pf2d_resample_systematic_core(PF2D *pf)
 {
     int n = pf->n_particles;
     pf2d_real *w = pf->weights;
     pf2d_real *cs = pf->cumsum;
+    int *indices = pf->indices;
 
 #ifdef PF2D_HIGH_N
-    /* HIGH-N PATH: Parallel cumsum */
     parallel_cumsum(cs, w, n);
 #else
-    /* Standard sequential cumsum */
     cs[0] = w[0];
     for (int i = 1; i < n; i++)
     {
@@ -1104,36 +1160,12 @@ void pf2d_resample(PF2D *pf)
 #ifdef PF2D_HIGH_N
     if (n >= PF2D_PARALLEL_SEARCH_THRESH)
     {
-        /* HIGH-N PATH: Parallel search */
-
-        /* Generate search sites in parallel */
         pf2d_real *search_sites = pf->scratch1;
         parallel_stratified_uniform(search_sites, u0, inv_n, n);
-
-        /* Batch binary search in parallel - use proper int buffer */
-        int *indices = pf->indices;
         parallel_batch_search(cs, search_sites, indices, n);
-
-/* Parallel gather */
-#pragma omp parallel
-        {
-            int i;
-#pragma omp for schedule(static)
-            for (i = 0; i < n; i++)
-            {
-                int idx = indices[i];
-                pf->prices_tmp[i] = pf->prices[idx];
-                pf->log_vols_tmp[i] = pf->log_vols[idx];
-                pf->regimes_tmp[i] = pf->regimes[idx];
-            }
-        }
     }
     else
     {
-        /* Medium N: sequential search with parallel gather */
-        int *indices = pf->indices;
-
-        /* Sequential systematic resampling (low overhead for N < 16k) */
         int idx = 0;
         for (int i = 0; i < n; i++)
         {
@@ -1142,25 +1174,8 @@ void pf2d_resample(PF2D *pf)
                 idx++;
             indices[i] = idx;
         }
-
-/* Parallel gather */
-#pragma omp parallel
-        {
-            int i;
-#pragma omp for schedule(static)
-            for (i = 0; i < n; i++)
-            {
-                int idx = indices[i];
-                pf->prices_tmp[i] = pf->prices[idx];
-                pf->log_vols_tmp[i] = pf->log_vols[idx];
-                pf->regimes_tmp[i] = pf->regimes[idx];
-            }
-        }
     }
 #else
-    /* STANDARD PATH: Sequential resampling */
-
-    /* Check for skewed weights */
     pf2d_real ess = pf2d_effective_sample_size(pf);
     int use_binary = (ess < n * 0.1);
 
@@ -1169,10 +1184,7 @@ void pf2d_resample(PF2D *pf)
         for (int i = 0; i < n; i++)
         {
             pf2d_real u = u0 + i * inv_n;
-            int idx = binary_search_cumsum(cs, n, u);
-            pf->prices_tmp[i] = pf->prices[idx];
-            pf->log_vols_tmp[i] = pf->log_vols[idx];
-            pf->regimes_tmp[i] = pf->regimes[idx];
+            indices[i] = binary_search_cumsum(cs, n, u);
         }
     }
     else
@@ -1183,12 +1195,185 @@ void pf2d_resample(PF2D *pf)
             pf2d_real u = u0 + i * inv_n;
             while (cs[idx] < u && idx < n - 1)
                 idx++;
+            indices[i] = idx;
+        }
+    }
+#endif
+}
+
+/**
+ * @brief Residual resampling (internal helper)
+ *
+ * Lower variance than systematic:
+ *   1. Deterministically copy floor(N * w[i]) times for each particle
+ *   2. Systematic resample the fractional remainder
+ *
+ * Populates indices[] with parent indices.
+ */
+static void pf2d_resample_residual_core(PF2D *pf)
+{
+    int n = pf->n_particles;
+    pf2d_real *w = pf->weights;
+    int *indices = pf->indices;
+    int *counts = pf->resample_count;
+    pf2d_real *residuals = pf->cumsum; /* Reuse cumsum buffer for residual weights */
+
+    /* Phase 1: Deterministic copies */
+    int total_deterministic = 0;
+    pf2d_real residual_sum = (pf2d_real)0.0;
+
+    for (int i = 0; i < n; i++)
+    {
+        pf2d_real expected = w[i] * (pf2d_real)n;
+        int floor_count = (int)expected;
+        counts[i] = floor_count;
+        total_deterministic += floor_count;
+
+        pf2d_real residual = expected - (pf2d_real)floor_count;
+        residuals[i] = residual;
+        residual_sum += residual;
+    }
+
+    /* Fill indices with deterministic copies */
+    int out_idx = 0;
+    for (int i = 0; i < n; i++)
+    {
+        for (int c = 0; c < counts[i]; c++)
+        {
+            indices[out_idx++] = i;
+        }
+    }
+
+    /* Phase 2: Stochastic resampling of remainder */
+    int n_stochastic = n - total_deterministic;
+
+    if (n_stochastic > 0 && residual_sum > (pf2d_real)1e-10)
+    {
+        /* Normalize residuals to sum to 1 */
+        pf2d_real inv_sum = (pf2d_real)1.0 / residual_sum;
+        for (int i = 0; i < n; i++)
+        {
+            residuals[i] *= inv_sum;
+        }
+
+        /* Build cumsum of residuals */
+        pf2d_real *cs = pf->scratch1; /* Use scratch for cumsum */
+        cs[0] = residuals[0];
+        for (int i = 1; i < n; i++)
+        {
+            cs[i] = cs[i - 1] + residuals[i];
+        }
+        cs[n - 1] = (pf2d_real)1.0; /* Ensure exact 1.0 */
+
+        /* Systematic resampling on residuals */
+        pf2d_real u0;
+        if (pf->use_pcg)
+        {
+            u0 = pf2d_pcg32_uniform(&pf->pcg[0]);
+        }
+        else
+        {
+            pf2d_RngUniform(VSL_RNG_METHOD_UNIFORM_STD, pf->mkl_rng[0], 1, &u0, 0.0, 1.0);
+        }
+        u0 /= (pf2d_real)n_stochastic;
+
+        pf2d_real step = (pf2d_real)1.0 / (pf2d_real)n_stochastic;
+        int idx = 0;
+        for (int i = 0; i < n_stochastic; i++)
+        {
+            pf2d_real u = u0 + i * step;
+            while (cs[idx] < u && idx < n - 1)
+                idx++;
+            indices[out_idx++] = idx;
+        }
+    }
+}
+
+/**
+ * @brief Apply regularization (kernel jitter) after resampling
+ *
+ * Adds Gaussian noise to break duplicate particles:
+ *   price[i]   += h_price * N(0,1)
+ *   log_vol[i] += h_vol   * N(0,1)
+ *
+ * Bandwidth scales with ESS: more jitter when ESS is low.
+ */
+static void pf2d_apply_regularization(PF2D *pf)
+{
+    int n = pf->n_particles;
+    pf2d_real *prices = pf->prices;
+    pf2d_real *log_vols = pf->log_vols;
+    pf2d_real *jitter_p = pf->scratch1;
+    pf2d_real *jitter_v = pf->scratch2;
+
+    /* Compute adaptive bandwidth scale based on ESS */
+    pf2d_real ess_ratio = pf->last_ess / (pf2d_real)n;
+
+    /* Scale: low ESS → more jitter, high ESS → less jitter
+     * Linear interpolation: scale = max - (max - min) * ess_ratio */
+    pf2d_real scale = pf->reg_scale_max -
+                      (pf->reg_scale_max - pf->reg_scale_min) * ess_ratio;
+
+    /* Clamp scale to valid range */
+    if (scale < pf->reg_scale_min)
+        scale = pf->reg_scale_min;
+    if (scale > pf->reg_scale_max)
+        scale = pf->reg_scale_max;
+
+    pf2d_real h_p = pf->reg_bandwidth_price * scale;
+    pf2d_real h_v = pf->reg_bandwidth_vol * scale;
+
+    /* Generate jitter noise */
+    if (pf->use_pcg)
+    {
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            pf2d_pcg32_t *rng = &pf->pcg[tid];
+            int i;
+
+#pragma omp for schedule(static)
+            for (i = 0; i < n; i++)
+            {
+                jitter_p[i] = h_p * pf2d_pcg32_gaussian(rng);
+                jitter_v[i] = h_v * pf2d_pcg32_gaussian(rng);
+            }
+        }
+    }
+    else
+    {
+        /* MKL vectorized RNG - generates N(0, h) directly */
+        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[0],
+                         n, jitter_p, 0.0, h_p);
+        pf2d_RngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, pf->mkl_rng[0],
+                         n, jitter_v, 0.0, h_v);
+    }
+
+    /* Apply jitter using BLAS axpy: prices += jitter_p */
+    pf2d_cblas_axpy(n, (pf2d_real)1.0, jitter_p, 1, prices, 1);
+    pf2d_cblas_axpy(n, (pf2d_real)1.0, jitter_v, 1, log_vols, 1);
+}
+
+/**
+ * @brief Gather particles according to indices and swap buffers
+ */
+static void pf2d_resample_gather_and_swap(PF2D *pf)
+{
+    int n = pf->n_particles;
+    int *indices = pf->indices;
+
+#pragma omp parallel
+    {
+        int i;
+#pragma omp for schedule(static)
+        for (i = 0; i < n; i++)
+        {
+            int idx = indices[i];
             pf->prices_tmp[i] = pf->prices[idx];
             pf->log_vols_tmp[i] = pf->log_vols[idx];
             pf->regimes_tmp[i] = pf->regimes[idx];
         }
     }
-#endif
 
     /* Swap pointers */
     pf2d_real *tmp;
@@ -1202,9 +1387,43 @@ void pf2d_resample(PF2D *pf)
     int *tmp_i = pf->regimes;
     pf->regimes = pf->regimes_tmp;
     pf->regimes_tmp = tmp_i;
+}
 
-    /* Reset weights */
-     pf2d_fill_constant(w, n, inv_n);
+/**
+ * @brief Main resampling function - dispatches to selected method
+ */
+void pf2d_resample(PF2D *pf)
+{
+    int n = pf->n_particles;
+    pf2d_real inv_n = pf->uniform_weight;
+
+    /* Select resampling core based on method */
+    switch (pf->resample_method)
+    {
+    case PF2D_RESAMPLE_RESIDUAL:
+    case PF2D_RESAMPLE_RESIDUAL_REGULARIZED:
+        pf2d_resample_residual_core(pf);
+        break;
+
+    case PF2D_RESAMPLE_SYSTEMATIC:
+    case PF2D_RESAMPLE_REGULARIZED:
+    default:
+        pf2d_resample_systematic_core(pf);
+        break;
+    }
+
+    /* Gather particles and swap buffers */
+    pf2d_resample_gather_and_swap(pf);
+
+    /* Apply regularization (kernel jitter) if requested */
+    if (pf->resample_method == PF2D_RESAMPLE_REGULARIZED ||
+        pf->resample_method == PF2D_RESAMPLE_RESIDUAL_REGULARIZED)
+    {
+        pf2d_apply_regularization(pf);
+    }
+
+    /* Reset weights to uniform */
+    pf2d_fill_constant(pf->weights, n, inv_n);
 }
 
 static inline void pf2d_update_resample_threshold(PF2D *pf, pf2d_real current_vol)
@@ -1308,17 +1527,17 @@ static void pf2d_compute_estimates_fused(const PF2D *pf, PF2DOutput *out)
     /* SINGLE PASS using E[X²] - E[X]² formula for variance
      * Reads each array only once - better cache utilization */
     pf2d_real sum_wp = 0, sum_wlv = 0, sum_ww = 0;
-    pf2d_real sum_wp2 = 0, sum_wlv2 = 0;  /* For E[X²] */
+    pf2d_real sum_wp2 = 0, sum_wlv2 = 0; /* For E[X²] */
 
     for (int i = 0; i < n; i++)
     {
         pf2d_real wi = w[i];
         pf2d_real pi = p[i];
         pf2d_real lvi = lv[i];
-        
-        sum_wp  += wi * pi;
+
+        sum_wp += wi * pi;
         sum_wlv += wi * lvi;
-        sum_ww  += wi * wi;
+        sum_ww += wi * wi;
         sum_wp2 += wi * pi * pi;
         sum_wlv2 += wi * lvi * lvi;
     }
@@ -1330,10 +1549,12 @@ static void pf2d_compute_estimates_fused(const PF2D *pf, PF2DOutput *out)
     /* Var(X) = E[X²] - E[X]² */
     pf2d_real price_variance = sum_wp2 - sum_wp * sum_wp;
     pf2d_real log_vol_variance = sum_wlv2 - sum_wlv * sum_wlv;
-    
+
     /* Clamp to avoid negative variance from numerical error */
-    if (price_variance < 0) price_variance = 0;
-    if (log_vol_variance < 0) log_vol_variance = 0;
+    if (price_variance < 0)
+        price_variance = 0;
+    if (log_vol_variance < 0)
+        log_vol_variance = 0;
 
     pf2d_real vol_mean = (pf2d_real)exp((double)(log_vol_mean + log_vol_variance * 0.5));
 
@@ -1399,7 +1620,13 @@ PF2DOutput pf2d_update(PF2D *pf, pf2d_real observation, const PF2DRegimeProbs *r
     /* 4. Update adaptive threshold */
     pf2d_update_resample_threshold(pf, out.vol_mean);
 
-    /* 5. Resample if needed */
+    /* 5. Adaptive self-calibration (implemented in pf2d_adaptive.c) */
+    pf2d_adaptive_tick(pf, &out);
+
+    /* 6. Resample if needed */
+    /* Cache ESS for regularization bandwidth scaling */
+    pf->last_ess = out.ess;
+
     /* Use pre-computed ESS - avoids redundant cblas_dot call */
     if (out.ess < pf->n_particles * pf->resample_threshold)
     {
@@ -1547,6 +1774,22 @@ void pf2d_print_config(const PF2D *pf)
            (double)pf->resample_threshold,
            (double)PF2D_RESAMPLE_THRESH_MIN, (double)PF2D_RESAMPLE_THRESH_MAX);
 
+    /* Resampling method */
+    const char *resample_names[] = {
+        "SYSTEMATIC",
+        "RESIDUAL",
+        "REGULARIZED",
+        "RESIDUAL_REGULARIZED"};
+    printf("  Resample method: %s\n", resample_names[pf->resample_method]);
+    if (pf->resample_method == PF2D_RESAMPLE_REGULARIZED ||
+        pf->resample_method == PF2D_RESAMPLE_RESIDUAL_REGULARIZED)
+    {
+        printf("    Bandwidth (price): %.6f\n", (double)pf->reg_bandwidth_price);
+        printf("    Bandwidth (vol):   %.4f\n", (double)pf->reg_bandwidth_vol);
+        printf("    Scale range:       [%.2f, %.2f]\n",
+               (double)pf->reg_scale_min, (double)pf->reg_scale_max);
+    }
+
     printf("\n  Per-regime parameters:\n");
     printf("  %-8s %8s %8s %8s %8s %8s\n",
            "Regime", "drift", "θ_vol", "μ_vol", "σ_vol", "ρ");
@@ -1560,24 +1803,26 @@ void pf2d_print_config(const PF2D *pf)
 }
 
 /* Wrapper to export mkl_config function */
-void pf2d_mkl_config_14900kf(int verbose) {
-    /* Set P-core affinity */
-    #ifdef _WIN32
+void pf2d_mkl_config_14900kf(int verbose)
+{
+/* Set P-core affinity */
+#ifdef _WIN32
     _putenv_s("KMP_AFFINITY", "granularity=fine,compact,1,0");
     _putenv_s("KMP_HW_SUBSET", "8c,2t");
     _putenv_s("MKL_ENABLE_INSTRUCTIONS", "AVX2");
-    #else
+#else
     setenv("KMP_AFFINITY", "granularity=fine,compact,1,0", 1);
     setenv("KMP_HW_SUBSET", "8c,2t", 1);
     setenv("MKL_ENABLE_INSTRUCTIONS", "AVX2", 1);
-    #endif
-    
+#endif
+
     /* 16 P-core threads */
     omp_set_num_threads(16);
     mkl_set_num_threads(16);
     mkl_set_dynamic(0);
-    
-    if (verbose) {
+
+    if (verbose)
+    {
         printf("MKL configured: 16 P-core threads, AVX2, P-core affinity\n");
     }
 }

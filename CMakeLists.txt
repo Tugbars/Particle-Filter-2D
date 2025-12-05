@@ -158,6 +158,7 @@ if(BUILD_2D)
     # Shared library
     add_library(particle_filter_2d_shared SHARED
         2D/particle_filter_2d.c
+        2D/pf2d_adaptive.c   
     )
 
     target_include_directories(particle_filter_2d_shared PUBLIC
