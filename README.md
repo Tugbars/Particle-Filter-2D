@@ -16,6 +16,7 @@ Tested on Intel i9-14900KF (8 P-cores, 16 threads), 4000 particles, 1000 ticks:
 | FilterPy (NumPy) | 710.9 | 1,407/sec | 41.4× slower |
 
 **→ pf2d is 41× faster than FilterPy and 12× faster than the academic reference implementation.**
+Note: mesured with benchmark_comparison.py in python folder
 
 ---
 
