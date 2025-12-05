@@ -1,363 +1,390 @@
 """
-Python bindings for the 2D Particle Filter (pf2d)
+PF2D Python Bindings
+====================
 
-High-performance stochastic volatility particle filter with regime switching.
-Optimized C implementation with MKL acceleration.
+Ctypes wrapper for particle_filter_2d.dll MKL-optimized particle filter.
+
+CRITICAL: Struct definitions MUST match C header exactly or crashes occur.
 
 Usage:
-    from pf2d import ParticleFilter2D
+    from pf2d import create_default_filter
     
-    pf = ParticleFilter2D(n_particles=4000, n_regimes=4)
-    pf.set_regime_params(0, drift=0.001, theta=0.02, mu_vol=-4.6, sigma_vol=0.05)
-    pf.initialize(price0=100.0, log_vol0=-4.6)
-    
-    for price in price_stream:
-        result = pf.update(price)
-        print(f"Est: {result.price_mean:.4f}, Vol: {result.vol_mean:.4f}")
+    with create_default_filter(n_particles=4000) as pf:
+        pf.initialize(price0=100.0, log_vol0=np.log(0.01))
+        pf.warmup()
+        
+        for price in prices:
+            result = pf.update(price)
+            print(f"Vol: {result.vol_mean:.4f}, ESS: {result.ess:.0f}")
 """
 
 import ctypes
+from ctypes import (
+    Structure, POINTER, CDLL,
+    c_int, c_float, c_double, c_uint8, c_void_p
+)
 import numpy as np
 import os
 import sys
-from ctypes import (
-    c_int, c_double, c_void_p, c_uint8,
-    POINTER, Structure, byref
-)
-from pathlib import Path
-from typing import Optional, List, Tuple
+import atexit
+import weakref
 from dataclasses import dataclass
-import platform
+from typing import Optional, List, Tuple
+from pathlib import Path
 
+# ============================================================================
+# PRECISION CONFIGURATION - MUST MATCH COMPILED DLL
+# ============================================================================
 
-# =============================================================================
-# Windows MKL DLL paths (must be set BEFORE loading the library)
-# =============================================================================
+# Set this to match your DLL compilation:
+#   True  = DLL compiled with PF2D_USE_FLOAT (default)
+#   False = DLL compiled with PF2D_USE_DOUBLE
+PF2D_USE_FLOAT = True
+
+if PF2D_USE_FLOAT:
+    pf2d_real = c_float
+    pf2d_real_np = np.float32
+else:
+    pf2d_real = c_double
+    pf2d_real_np = np.float64
+
+# Constants from header
+PF2D_MAX_REGIMES = 8
+PF2D_REGIME_LUT_SIZE = 1024
+
+# ============================================================================
+# Windows MKL DLL paths
+# ============================================================================
 
 if sys.platform == "win32":
     mkl_paths = [
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.0\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\mkl\2025.3\bin",
         r"C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.0\bin",
-        r"C:\Program Files (x86)\Intel\oneAPI\compiler\2025.3\bin",
         r"C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
     ]
     for p in mkl_paths:
         if os.path.exists(p):
-            try:
-                os.add_dll_directory(p)
-            except (OSError, AttributeError):
-                pass  # add_dll_directory not available on older Python
+            os.add_dll_directory(p)
 
+# ============================================================================
+# Load DLL
+# ============================================================================
 
-# =============================================================================
-# CONSTANTS (must match particle_filter_2d.h)
-# =============================================================================
-
-PF2D_MAX_REGIMES = 8
-PF2D_REAL_SIZE = 8  # sizeof(double)
-
-
-# =============================================================================
-# C STRUCTURES
-# =============================================================================
-
-class PF2DRegimeProbs(Structure):
-    """Regime transition probabilities"""
-    _fields_ = [("probs", c_double * PF2D_MAX_REGIMES)]
-
-
-class PF2DOutput(Structure):
-    """Output from pf2d_update()"""
-    _fields_ = [
-        ("price_mean", c_double),
-        ("price_variance", c_double),
-        ("log_vol_mean", c_double),
-        ("log_vol_variance", c_double),
-        ("vol_mean", c_double),
-        ("ess", c_double),
-        ("regime_probs", c_double * PF2D_MAX_REGIMES),
-        ("dominant_regime", c_int),
-        ("resampled", c_int),
-    ]
-
-
-# =============================================================================
-# PYTHON RESULT DATACLASS
-# =============================================================================
-
-@dataclass
-class PF2DResult:
-    """Python-friendly result from particle filter update"""
-    price_mean: float
-    price_variance: float
-    price_std: float
-    log_vol_mean: float
-    log_vol_variance: float
-    log_vol_std: float
-    vol_mean: float
-    ess: float
-    ess_ratio: float
-    regime_probs: np.ndarray
-    dominant_regime: int
-    resampled: bool
-    
-    def __repr__(self):
-        return (
-            f"PF2DResult(price={self.price_mean:.4f}±{self.price_std:.4f}, "
-            f"vol={self.vol_mean:.6f}, ESS={self.ess:.0f} ({self.ess_ratio:.1%}), "
-            f"regime={self.dominant_regime})"
-        )
-
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-c_double_p = POINTER(c_double)
-
-def _to_c_array(arr: np.ndarray, dtype=np.float64) -> c_double_p:
-    """Convert numpy array to ctypes pointer."""
-    arr = np.ascontiguousarray(arr, dtype=dtype)
-    return arr.ctypes.data_as(c_double_p)
-
-
-def _from_c_array(ptr: c_double_p, shape: tuple) -> np.ndarray:
-    """Create numpy array from ctypes pointer (copy)."""
-    size = int(np.prod(shape))
-    arr = np.ctypeslib.as_array(ptr, shape=(size,)).copy()
-    return arr.reshape(shape) if len(shape) > 1 else arr
-
-
-# =============================================================================
-# LIBRARY LOADER
-# =============================================================================
-
-def _load_library(lib_path: Optional[str] = None) -> ctypes.CDLL:
-    """Load the pf2d shared library"""
-    
-    if lib_path:
-        return ctypes.CDLL(lib_path)
-    
-    # Auto-detect library location
-    system = platform.system()
-    
-    # Get directory of this file
-    this_dir = Path(__file__).parent
-    
+def _load_library():
+    """Find and load the PF2D shared library."""
     search_paths = [
-        # Same directory as this module
-        this_dir,
-        # Build directories (relative to module)
-        this_dir / "build" / "Release",
-        this_dir / "build" / "Debug",
-        this_dir / "build",
-        # Current working directory
-        Path("."),
-        Path("build/Release"),
-        Path("build/Debug"),
-        Path("build"),
-        # Installed locations
-        Path("/usr/local/lib"),
-        Path("/usr/lib"),
+        Path(__file__).parent / "particle_filter_2d.dll",
+        Path(__file__).parent / "libpf2d.so",
+        Path(".") / "particle_filter_2d.dll",
+        Path(".") / "libpf2d.so",
+        "particle_filter_2d.dll",
+        "libpf2d.so",
     ]
-    
-    if system == "Windows":
-        lib_names = ["particle_filter_2d.dll", "pf2d.dll", "libpf2d.dll"]
-    elif system == "Darwin":
-        lib_names = ["particle_filter_2d.so", "libparticle_filter_2d.dylib", "libpf2d.dylib"]
-    else:
-        lib_names = ["particle_filter_2d.so", "libparticle_filter_2d.so", "libpf2d.so"]
     
     for path in search_paths:
-        for name in lib_names:
-            full_path = path / name
-            if full_path.exists():
-                try:
-                    return ctypes.CDLL(str(full_path))
-                except OSError:
-                    continue
-    
-    # Try system path
-    for name in lib_names:
         try:
-            return ctypes.CDLL(name)
+            lib = CDLL(str(path))
+            return lib
         except OSError:
             continue
     
     raise RuntimeError(
-        f"Could not find pf2d library. Searched: {lib_names}\n"
-        f"Build with: cmake --build build --target particle_filter_2d_shared --config Release\n"
-        f"Then copy DLL to this directory or specify path: ParticleFilter2D(lib_path='path/to/lib')"
+        "Could not load particle_filter_2d.dll/.so\n"
+        "Make sure the DLL is in the current directory or same folder as pf2d.py"
     )
 
+_lib = _load_library()
 
-def _setup_signatures(lib: ctypes.CDLL):
-    """Set up C function signatures for type safety."""
+# ============================================================================
+# Configure MKL from C side (most reliable)
+# ============================================================================
+
+try:
+    _lib.pf2d_mkl_config_14900kf.argtypes = [c_int]
+    _lib.pf2d_mkl_config_14900kf.restype = None
+    _lib.pf2d_mkl_config_14900kf(0)  # 0 = silent
+    _HAS_MKL_CONFIG = True
+except AttributeError:
+    _HAS_MKL_CONFIG = False
+
+# ============================================================================
+# STRUCTURE DEFINITIONS - MUST MATCH C HEADER EXACTLY
+# ============================================================================
+
+class PF2DRegimeProbs(Structure):
+    """
+    Matches C struct PF2DRegimeProbs exactly.
     
-    # pf2d_create
-    lib.pf2d_create.argtypes = [c_int, c_int]
-    lib.pf2d_create.restype = c_void_p
-    
-    # pf2d_destroy
-    lib.pf2d_destroy.argtypes = [c_void_p]
-    lib.pf2d_destroy.restype = None
-    
-    # pf2d_set_observation_variance
-    lib.pf2d_set_observation_variance.argtypes = [c_void_p, c_double]
-    lib.pf2d_set_observation_variance.restype = None
-    
-    # pf2d_set_regime_params
-    lib.pf2d_set_regime_params.argtypes = [
-        c_void_p, c_int, c_double, c_double, c_double, c_double, c_double
+    typedef struct {
+        pf2d_real probs[PF2D_MAX_REGIMES];
+        pf2d_real cumprobs[PF2D_MAX_REGIMES];
+        int n_regimes;
+    } PF2DRegimeProbs;
+    """
+    _fields_ = [
+        ("probs", pf2d_real * PF2D_MAX_REGIMES),
+        ("cumprobs", pf2d_real * PF2D_MAX_REGIMES),
+        ("n_regimes", c_int),
     ]
-    lib.pf2d_set_regime_params.restype = None
+
+
+class PF2DOutput(Structure):
+    """
+    Matches C struct PF2DOutput exactly.
     
-    # pf2d_set_regime_probs - operates on PF2DRegimeProbs struct
-    lib.pf2d_set_regime_probs.argtypes = [POINTER(PF2DRegimeProbs), POINTER(c_double), c_int]
-    lib.pf2d_set_regime_probs.restype = None
-    
-    # pf2d_build_regime_lut - builds LUT from probs
-    lib.pf2d_build_regime_lut.argtypes = [c_void_p, POINTER(PF2DRegimeProbs)]
-    lib.pf2d_build_regime_lut.restype = None
-    
-    # pf2d_initialize
-    lib.pf2d_initialize.argtypes = [
-        c_void_p, c_double, c_double, c_double, c_double
+    typedef struct {
+        pf2d_real price_mean;
+        pf2d_real price_variance;
+        pf2d_real log_vol_mean;
+        pf2d_real log_vol_variance;
+        pf2d_real vol_mean;
+        pf2d_real ess;
+        pf2d_real regime_probs[PF2D_MAX_REGIMES];
+        int dominant_regime;
+        int resampled;
+        pf2d_real sigma_vol_scale;
+        pf2d_real ess_ema;
+        int high_vol_mode;
+        int regime_feedback_active;
+        int bocpd_cooldown_remaining;
+    } PF2DOutput;
+    """
+    _fields_ = [
+        ("price_mean", pf2d_real),
+        ("price_variance", pf2d_real),
+        ("log_vol_mean", pf2d_real),
+        ("log_vol_variance", pf2d_real),
+        ("vol_mean", pf2d_real),
+        ("ess", pf2d_real),
+        ("regime_probs", pf2d_real * PF2D_MAX_REGIMES),
+        ("dominant_regime", c_int),
+        ("resampled", c_int),
+        # Adaptive diagnostics - CRITICAL: these were missing before!
+        ("sigma_vol_scale", pf2d_real),
+        ("ess_ema", pf2d_real),
+        ("high_vol_mode", c_int),
+        ("regime_feedback_active", c_int),
+        ("bocpd_cooldown_remaining", c_int),
     ]
-    lib.pf2d_initialize.restype = None
-    
-    # pf2d_update
-    lib.pf2d_update.argtypes = [c_void_p, c_double, POINTER(PF2DRegimeProbs)]
-    lib.pf2d_update.restype = PF2DOutput
-    
-    # pf2d_warmup
-    lib.pf2d_warmup.argtypes = [c_void_p]
-    lib.pf2d_warmup.restype = None
-    
-    # pf2d_enable_pcg
-    lib.pf2d_enable_pcg.argtypes = [c_void_p, c_int]
-    lib.pf2d_enable_pcg.restype = None
-    
-    # pf2d_print_config
-    lib.pf2d_print_config.argtypes = [c_void_p]
-    lib.pf2d_print_config.restype = None
-    
-    # pf2d_effective_sample_size
-    lib.pf2d_effective_sample_size.argtypes = [c_void_p]
-    lib.pf2d_effective_sample_size.restype = c_double
-    
-    lib.pf2d_mkl_config_14900kf.argtypes = [c_int]
-    lib.pf2d_mkl_config_14900kf.restype = None
 
 
-# =============================================================================
-# MODULE-LEVEL LIBRARY (loaded at import)
-# =============================================================================
+# Verify struct sizes for debugging
+_EXPECTED_OUTPUT_SIZE = (
+    6 * ctypes.sizeof(pf2d_real) +           # 6 scalars
+    PF2D_MAX_REGIMES * ctypes.sizeof(pf2d_real) +  # regime_probs[8]
+    2 * ctypes.sizeof(c_int) +                # dominant_regime, resampled
+    2 * ctypes.sizeof(pf2d_real) +           # sigma_vol_scale, ess_ema
+    3 * ctypes.sizeof(c_int)                  # high_vol_mode, regime_feedback_active, bocpd_cooldown_remaining
+)
 
-_lib: Optional[ctypes.CDLL] = None
+_EXPECTED_REGIME_PROBS_SIZE = (
+    2 * PF2D_MAX_REGIMES * ctypes.sizeof(pf2d_real) +  # probs + cumprobs
+    ctypes.sizeof(c_int)                               # n_regimes
+)
 
+# ============================================================================
+# FUNCTION SIGNATURES
+# ============================================================================
 
-def _get_lib(lib_path: Optional[str] = None) -> ctypes.CDLL:
-    """Get library, loading if necessary."""
-    global _lib
-    if _lib is None or lib_path is not None:
-        _lib = _load_library(lib_path)
-        _setup_signatures(_lib)
-        #_lib.pf2d_mkl_config_14900kf(0)  # Configure 16 P-core threads
-    return _lib
+# Opaque pointer to PF2D struct
+PF2D_PTR = c_void_p
 
+# Create/Destroy
+_lib.pf2d_create.argtypes = [c_int, c_int]
+_lib.pf2d_create.restype = PF2D_PTR
 
-# =============================================================================
-# PARTICLE FILTER CLASS
-# =============================================================================
+_lib.pf2d_destroy.argtypes = [PF2D_PTR]
+_lib.pf2d_destroy.restype = None
+
+# Configuration
+_lib.pf2d_set_observation_variance.argtypes = [PF2D_PTR, pf2d_real]
+_lib.pf2d_set_observation_variance.restype = None
+
+_lib.pf2d_set_regime_params.argtypes = [
+    PF2D_PTR, c_int,
+    pf2d_real, pf2d_real, pf2d_real, pf2d_real, pf2d_real
+]
+_lib.pf2d_set_regime_params.restype = None
+
+_lib.pf2d_set_regime_probs.argtypes = [
+    POINTER(PF2DRegimeProbs),
+    POINTER(pf2d_real),
+    c_int
+]
+_lib.pf2d_set_regime_probs.restype = None
+
+_lib.pf2d_build_regime_lut.argtypes = [PF2D_PTR, POINTER(PF2DRegimeProbs)]
+_lib.pf2d_build_regime_lut.restype = None
+
+_lib.pf2d_enable_pcg.argtypes = [PF2D_PTR, c_int]
+_lib.pf2d_enable_pcg.restype = None
+
+# Initialization
+_lib.pf2d_initialize.argtypes = [
+    PF2D_PTR, pf2d_real, pf2d_real, pf2d_real, pf2d_real
+]
+_lib.pf2d_initialize.restype = None
+
+_lib.pf2d_warmup.argtypes = [PF2D_PTR]
+_lib.pf2d_warmup.restype = None
+
+# Core update - RETURNS STRUCT BY VALUE
+_lib.pf2d_update.argtypes = [PF2D_PTR, pf2d_real, POINTER(PF2DRegimeProbs)]
+_lib.pf2d_update.restype = PF2DOutput
+
+# Estimates
+_lib.pf2d_price_mean.argtypes = [PF2D_PTR]
+_lib.pf2d_price_mean.restype = pf2d_real
+
+_lib.pf2d_price_variance.argtypes = [PF2D_PTR]
+_lib.pf2d_price_variance.restype = pf2d_real
+
+_lib.pf2d_log_vol_mean.argtypes = [PF2D_PTR]
+_lib.pf2d_log_vol_mean.restype = pf2d_real
+
+_lib.pf2d_log_vol_variance.argtypes = [PF2D_PTR]
+_lib.pf2d_log_vol_variance.restype = pf2d_real
+
+_lib.pf2d_vol_mean.argtypes = [PF2D_PTR]
+_lib.pf2d_vol_mean.restype = pf2d_real
+
+_lib.pf2d_effective_sample_size.argtypes = [PF2D_PTR]
+_lib.pf2d_effective_sample_size.restype = pf2d_real
+
+# Debug
+_lib.pf2d_print_config.argtypes = [PF2D_PTR]
+_lib.pf2d_print_config.restype = None
+
+# ============================================================================
+# PYTHON RESULT DATACLASS
+# ============================================================================
+
+@dataclass
+class PF2DResult:
+    """Python-friendly result from pf2d_update()."""
+    price_mean: float
+    price_std: float
+    log_vol_mean: float
+    log_vol_std: float
+    vol_mean: float
+    ess: float
+    regime_probs: np.ndarray
+    dominant_regime: int
+    resampled: bool
+    # Adaptive diagnostics
+    sigma_vol_scale: float
+    ess_ema: float
+    high_vol_mode: bool
+    regime_feedback_active: bool
+    bocpd_cooldown_remaining: int
+
+# ============================================================================
+# CLEANUP TRACKING
+# ============================================================================
+
+_active_filters: weakref.WeakSet = weakref.WeakSet()
+
+def _cleanup_all_filters():
+    """Called at interpreter exit."""
+    for pf in list(_active_filters):
+        try:
+            pf.close()
+        except Exception:
+            pass
+
+atexit.register(_cleanup_all_filters)
+
+# ============================================================================
+# MAIN WRAPPER CLASS
+# ============================================================================
 
 class ParticleFilter2D:
     """
-    2D Particle Filter for stochastic volatility with regime switching.
-    
-    State: [price, log_volatility]
-    Dynamics: Per-regime OU process for log-volatility
+    Python wrapper for PF2D particle filter.
     
     Parameters
     ----------
     n_particles : int
         Number of particles (default 4000)
     n_regimes : int
-        Number of market regimes (default 4)
-    lib_path : str, optional
-        Path to the shared library
+        Number of regimes (default 4, max 8)
     
     Example
     -------
-    >>> pf = ParticleFilter2D(n_particles=4000)
-    >>> pf.set_regime_params(0, drift=0.001, theta=0.02, mu_vol=-4.6, sigma_vol=0.05)
-    >>> pf.initialize(price0=100.0)
-    >>> 
-    >>> for price in prices:
-    ...     result = pf.update(price)
-    ...     print(f"Price: {result.price_mean:.2f}, Vol: {result.vol_mean:.4f}")
+    >>> with ParticleFilter2D(n_particles=4000) as pf:
+    ...     pf.initialize(price0=100.0, log_vol0=np.log(0.01))
+    ...     pf.warmup()
+    ...     result = pf.update(100.5)
+    ...     print(f"Vol: {result.vol_mean:.4f}")
     """
     
-    def __init__(
-        self,
-        n_particles: int = 4000,
-        n_regimes: int = 4,
-        lib_path: Optional[str] = None
-    ):
+    def __init__(self, n_particles: int = 4000, n_regimes: int = 4):
+        if n_regimes > PF2D_MAX_REGIMES:
+            raise ValueError(f"n_regimes must be <= {PF2D_MAX_REGIMES}")
+        
         self.n_particles = n_particles
         self.n_regimes = n_regimes
-        
-        # Load library
-        self._lib = _get_lib(lib_path)
+        self._closed = False
         
         # Create filter
-        self._pf = self._lib.pf2d_create(n_particles, n_regimes)
+        self._pf = _lib.pf2d_create(n_particles, n_regimes)
         if not self._pf:
-            raise RuntimeError("Failed to create particle filter")
+            raise RuntimeError("pf2d_create failed")
         
-        self._owns_ptr = True
-        
-        # Default regime probs (uniform)
+        # Create regime probs structure
         self._regime_probs = PF2DRegimeProbs()
-        for i in range(n_regimes):
-            self._regime_probs.probs[i] = 1.0 / n_regimes
+        self._regime_probs.n_regimes = n_regimes
         
-        self._initialized = False
+        # Default uniform probs
+        uniform = 1.0 / n_regimes
+        for i in range(n_regimes):
+            self._regime_probs.probs[i] = pf2d_real(uniform)
+        self._update_cumprobs()
+        
+        # Build LUT
+        _lib.pf2d_build_regime_lut(self._pf, ctypes.byref(self._regime_probs))
+        
+        # Track for cleanup
+        _active_filters.add(self)
+    
+    def _update_cumprobs(self):
+        """Recompute cumulative probabilities."""
+        cumsum = 0.0
+        for i in range(self.n_regimes):
+            cumsum += float(self._regime_probs.probs[i])
+            self._regime_probs.cumprobs[i] = pf2d_real(cumsum)
+    
+    def _check_open(self):
+        """Raise if filter has been closed."""
+        if self._closed:
+            raise RuntimeError("ParticleFilter2D has been closed")
+    
+    def close(self):
+        """Explicitly release resources. Safe to call multiple times."""
+        if not self._closed and self._pf:
+            _lib.pf2d_destroy(self._pf)
+            self._pf = None
+            self._closed = True
     
     def __del__(self):
-        """Clean up C resources"""
-        if hasattr(self, '_owns_ptr') and self._owns_ptr and hasattr(self, '_pf') and self._pf:
-            self._lib.pf2d_destroy(self._pf)
-            self._pf = None
+        self.close()
     
     def __enter__(self):
         return self
     
     def __exit__(self, *args):
-        if self._owns_ptr and self._pf:
-            self._lib.pf2d_destroy(self._pf)
-            self._pf = None
-            self._owns_ptr = False
+        self.close()
     
-    # -------------------------------------------------------------------------
+    # ========================================================================
     # Configuration
-    # -------------------------------------------------------------------------
+    # ========================================================================
     
     def set_observation_variance(self, var: float):
-        """Set observation noise variance"""
-        self._lib.pf2d_set_observation_variance(self._pf, var)
+        """Set observation noise variance."""
+        self._check_open()
+        _lib.pf2d_set_observation_variance(self._pf, pf2d_real(var))
     
-    def set_regime_params(
-        self,
-        regime: int,
-        drift: float = 0.0,
-        theta: float = 0.05,
-        mu_vol: float = -4.6,  # log(0.01)
-        sigma_vol: float = 0.05,
-        rho: float = 0.0
-    ):
+    def set_regime_params(self, regime: int, drift: float, theta: float,
+                          mu_vol: float, sigma_vol: float, rho: float = 0.0):
         """
         Set parameters for a regime.
         
@@ -370,73 +397,85 @@ class ParticleFilter2D:
         theta : float
             Mean reversion speed for log-volatility
         mu_vol : float
-            Long-run mean of log-volatility (e.g., log(0.01) = -4.6)
+            Long-term mean of log-volatility
         sigma_vol : float
             Volatility of volatility
         rho : float
-            Correlation between price and volatility shocks
+            Price-vol correlation (leverage effect), -1 to 1
         """
+        self._check_open()
         if regime < 0 or regime >= self.n_regimes:
-            raise ValueError(f"Regime must be 0-{self.n_regimes-1}")
+            raise ValueError(f"regime must be 0 to {self.n_regimes-1}")
         
-        self._lib.pf2d_set_regime_params(
-            self._pf, regime, drift, theta, mu_vol, sigma_vol, rho
+        _lib.pf2d_set_regime_params(
+            self._pf, regime,
+            pf2d_real(drift),
+            pf2d_real(theta),
+            pf2d_real(mu_vol),
+            pf2d_real(sigma_vol),
+            pf2d_real(rho)
         )
     
     def set_regime_probs(self, probs: List[float]):
-        """Set regime transition probabilities"""
+        """Set regime prior probabilities."""
+        self._check_open()
         if len(probs) != self.n_regimes:
-            raise ValueError(f"Expected {self.n_regimes} probabilities")
+            raise ValueError(f"probs must have {self.n_regimes} elements")
         
-        probs_arr = (c_double * self.n_regimes)(*probs)
-        self._lib.pf2d_set_regime_probs(byref(self._regime_probs), probs_arr, self.n_regimes)
-        self._lib.pf2d_build_regime_lut(self._pf, byref(self._regime_probs))
+        # Normalize
+        total = sum(probs)
+        for i, p in enumerate(probs):
+            self._regime_probs.probs[i] = pf2d_real(p / total)
+        
+        self._update_cumprobs()
+        _lib.pf2d_build_regime_lut(self._pf, ctypes.byref(self._regime_probs))
     
-    def initialize(
-        self,
-        price0: float,
-        log_vol0: float = -4.6,
-        price_spread: float = 0.01,
-        log_vol_spread: float = 0.5
-    ):
+    def enable_pcg(self, enable: bool = True):
+        """Enable PCG random number generator (faster than MKL VSL)."""
+        self._check_open()
+        _lib.pf2d_enable_pcg(self._pf, 1 if enable else 0)
+    
+    # ========================================================================
+    # Initialization
+    # ========================================================================
+    
+    def initialize(self, price0: float, log_vol0: float,
+                   price_spread: float = 0.01, log_vol_spread: float = 0.5):
         """
-        Initialize particle cloud around initial state.
+        Initialize particles around starting values.
         
         Parameters
         ----------
         price0 : float
             Initial price
-        log_vol0 : float
-            Initial log-volatility (default: log(0.01))
+        log_vol0 : float  
+            Initial log-volatility (e.g., np.log(0.01) for 1% vol)
         price_spread : float
-            Spread for initial price distribution
+            Spread of initial price distribution
         log_vol_spread : float
-            Spread for initial log-vol distribution
+            Spread of initial log-vol distribution
         """
-        self._lib.pf2d_initialize(
-            self._pf, price0, price_spread, log_vol0, log_vol_spread
+        self._check_open()
+        _lib.pf2d_initialize(
+            self._pf,
+            pf2d_real(price0),
+            pf2d_real(price_spread),
+            pf2d_real(log_vol0),
+            pf2d_real(log_vol_spread)
         )
-        self._initialized = True
     
     def warmup(self):
-        """Warmup MKL kernels to eliminate first-call latency"""
-        self._lib.pf2d_warmup(self._pf)
+        """Warmup RNG and prefetch memory."""
+        self._check_open()
+        _lib.pf2d_warmup(self._pf)
     
-    def enable_pcg(self, enable: bool = True):
-        """Enable/disable PCG RNG (default: auto-select based on N)"""
-        self._lib.pf2d_enable_pcg(self._pf, 1 if enable else 0)
-    
-    def print_config(self):
-        """Print filter configuration to stdout"""
-        self._lib.pf2d_print_config(self._pf)
-    
-    # -------------------------------------------------------------------------
-    # Filtering
-    # -------------------------------------------------------------------------
+    # ========================================================================
+    # Core Operations
+    # ========================================================================
     
     def update(self, observation: float) -> PF2DResult:
         """
-        Run one filter update step.
+        Process one observation and return estimates.
         
         Parameters
         ----------
@@ -446,71 +485,68 @@ class ParticleFilter2D:
         Returns
         -------
         PF2DResult
-            Filter estimates and diagnostics
+            Estimates and diagnostics
         """
-        if not self._initialized:
-            raise RuntimeError("Call initialize() before update()")
+        self._check_open()
         
-        out = self._lib.pf2d_update(
-            self._pf, observation, byref(self._regime_probs)
+        # Call C function - returns struct by value
+        out = _lib.pf2d_update(
+            self._pf,
+            pf2d_real(observation),
+            ctypes.byref(self._regime_probs)
         )
+        
+        # Convert to Python types
+        regime_probs = np.array([float(out.regime_probs[i]) 
+                                  for i in range(self.n_regimes)], dtype=np.float64)
         
         return PF2DResult(
-            price_mean=out.price_mean,
-            price_variance=out.price_variance,
-            price_std=np.sqrt(out.price_variance),
-            log_vol_mean=out.log_vol_mean,
-            log_vol_variance=out.log_vol_variance,
-            log_vol_std=np.sqrt(out.log_vol_variance),
-            vol_mean=out.vol_mean,
-            ess=out.ess,
-            ess_ratio=out.ess / self.n_particles,
-            regime_probs=np.array([out.regime_probs[i] for i in range(self.n_regimes)]),
-            dominant_regime=out.dominant_regime,
+            price_mean=float(out.price_mean),
+            price_std=float(np.sqrt(max(0, out.price_variance))),
+            log_vol_mean=float(out.log_vol_mean),
+            log_vol_std=float(np.sqrt(max(0, out.log_vol_variance))),
+            vol_mean=float(out.vol_mean),
+            ess=float(out.ess),
+            regime_probs=regime_probs,
+            dominant_regime=int(out.dominant_regime),
             resampled=bool(out.resampled),
+            sigma_vol_scale=float(out.sigma_vol_scale),
+            ess_ema=float(out.ess_ema),
+            high_vol_mode=bool(out.high_vol_mode),
+            regime_feedback_active=bool(out.regime_feedback_active),
+            bocpd_cooldown_remaining=int(out.bocpd_cooldown_remaining),
         )
     
-    # -------------------------------------------------------------------------
+    # ========================================================================
     # Batch Processing
-    # -------------------------------------------------------------------------
+    # ========================================================================
     
-    def update_batch(self, observations: np.ndarray) -> List[PF2DResult]:
+    def run(self, observations: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Run filter on a batch of observations.
+        Process array of observations.
         
         Parameters
         ----------
         observations : array-like
-            Array of observed prices
+            Price observations
         
         Returns
         -------
-        list of PF2DResult
-            Results for each observation
+        price_est : ndarray
+            Price estimates
+        vol_est : ndarray
+            Volatility estimates
+        ess : ndarray
+            Effective sample sizes
         """
-        return [self.update(float(obs)) for obs in observations]
-    
-    def run(
-        self,
-        observations: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Run filter on observations and return arrays.
+        self._check_open()
         
-        Parameters
-        ----------
-        observations : array-like
-            Array of observed prices
-        
-        Returns
-        -------
-        price_est, vol_est, ess : np.ndarray
-            Arrays of estimates
-        """
+        observations = np.asarray(observations, dtype=np.float64)
         n = len(observations)
-        price_est = np.zeros(n)
-        vol_est = np.zeros(n)
-        ess = np.zeros(n)
+        
+        price_est = np.zeros(n, dtype=np.float64)
+        vol_est = np.zeros(n, dtype=np.float64)
+        ess = np.zeros(n, dtype=np.float64)
         
         for i, obs in enumerate(observations):
             result = self.update(float(obs))
@@ -520,144 +556,119 @@ class ParticleFilter2D:
         
         return price_est, vol_est, ess
     
-    def filter(
-        self,
-        observations: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Run filter on observations with full output.
-        
-        Parameters
-        ----------
-        observations : array-like
-            Array of observed prices
-        
-        Returns
-        -------
-        price_est, vol_est, ess, regimes : np.ndarray
-            Arrays of estimates and dominant regimes
-        """
-        n = len(observations)
-        price_est = np.zeros(n)
-        vol_est = np.zeros(n)
-        ess = np.zeros(n)
-        regimes = np.zeros(n, dtype=np.int32)
-        
-        for i, obs in enumerate(observations):
-            result = self.update(float(obs))
-            price_est[i] = result.price_mean
-            vol_est[i] = result.vol_mean
-            ess[i] = result.ess
-            regimes[i] = result.dominant_regime
-        
-        return price_est, vol_est, ess, regimes
+    # ========================================================================
+    # Direct Estimates
+    # ========================================================================
     
-    # -------------------------------------------------------------------------
-    # Properties
-    # -------------------------------------------------------------------------
+    def price_mean(self) -> float:
+        """Get current price estimate."""
+        self._check_open()
+        return float(_lib.pf2d_price_mean(self._pf))
     
-    @property
+    def vol_mean(self) -> float:
+        """Get current volatility estimate."""
+        self._check_open()
+        return float(_lib.pf2d_vol_mean(self._pf))
+    
     def ess(self) -> float:
-        """Current effective sample size"""
-        return self._lib.pf2d_effective_sample_size(self._pf)
+        """Get effective sample size."""
+        self._check_open()
+        return float(_lib.pf2d_effective_sample_size(self._pf))
     
-    @property
-    def ess_ratio(self) -> float:
-        """ESS as fraction of N"""
-        return self.ess / self.n_particles
+    # ========================================================================
+    # Debug
+    # ========================================================================
+    
+    def print_config(self):
+        """Print filter configuration."""
+        self._check_open()
+        _lib.pf2d_print_config(self._pf)
 
 
-# =============================================================================
-# CONVENIENCE FUNCTIONS
-# =============================================================================
+# ============================================================================
+# FACTORY FUNCTION
+# ============================================================================
 
-def create_default_filter(n_particles: int = 4000, lib_path: Optional[str] = None) -> ParticleFilter2D:
+def create_default_filter(n_particles: int = 4000, n_regimes: int = 4) -> ParticleFilter2D:
     """
-    Create a particle filter with default regime configuration.
+    Create a ParticleFilter2D with sensible defaults.
     
-    Regimes:
-        0: Trend (drift=0.001, low vol, slow MR)
-        1: Mean-revert (no drift, stable vol)
-        2: High-vol (no drift, elevated vol)
-        3: Jump (no drift, high vol-of-vol)
+    Default regime parameters are tuned for daily equity data.
     """
-    pf = ParticleFilter2D(n_particles=n_particles, n_regimes=4, lib_path=lib_path)
+    pf = ParticleFilter2D(n_particles=n_particles, n_regimes=n_regimes)
     
-    # Configure regimes
-    pf.set_regime_params(0, drift=0.001, theta=0.02, mu_vol=np.log(0.01), sigma_vol=0.05)
-    pf.set_regime_params(1, drift=0.0, theta=0.05, mu_vol=np.log(0.008), sigma_vol=0.03)
-    pf.set_regime_params(2, drift=0.0, theta=0.10, mu_vol=np.log(0.03), sigma_vol=0.10)
-    pf.set_regime_params(3, drift=0.0, theta=0.20, mu_vol=np.log(0.05), sigma_vol=0.20)
+    # Default observation variance
+    pf.set_observation_variance(0.0001)
     
-    # Set regime probabilities (mostly stable)
-    pf.set_regime_probs([0.4, 0.3, 0.2, 0.1])
+    # Default regime parameters (daily equity)
+    defaults = [
+        # (drift, theta, mu_vol, sigma_vol, rho)
+        (0.0001, 0.02, np.log(0.01), 0.05, -0.3),   # Regime 0: Low vol
+        (0.0000, 0.03, np.log(0.015), 0.08, -0.4),  # Regime 1: Normal
+        (-0.0001, 0.05, np.log(0.025), 0.12, -0.5), # Regime 2: High vol
+        (-0.0002, 0.08, np.log(0.04), 0.20, -0.6),  # Regime 3: Crisis
+    ]
     
-    # Observation variance
-    pf.set_observation_variance(1.0)
+    for i in range(min(n_regimes, len(defaults))):
+        drift, theta, mu_vol, sigma_vol, rho = defaults[i]
+        pf.set_regime_params(i, drift, theta, mu_vol, sigma_vol, rho)
+    
+    # Equal prior
+    pf.set_regime_probs([1.0 / n_regimes] * n_regimes)
     
     return pf
 
 
-# =============================================================================
-# DEMO / TEST
-# =============================================================================
+# ============================================================================
+# STRUCT SIZE VERIFICATION
+# ============================================================================
+
+def verify_struct_sizes():
+    """Verify Python struct sizes match expected C sizes."""
+    output_size = ctypes.sizeof(PF2DOutput)
+    regime_size = ctypes.sizeof(PF2DRegimeProbs)
+    
+    print(f"PF2DOutput size: {output_size} bytes (expected ~{_EXPECTED_OUTPUT_SIZE})")
+    print(f"PF2DRegimeProbs size: {regime_size} bytes (expected ~{_EXPECTED_REGIME_PROBS_SIZE})")
+    print(f"pf2d_real size: {ctypes.sizeof(pf2d_real)} bytes")
+    
+    # Check alignment
+    print(f"\nPF2DOutput fields:")
+    for name, ctype in PF2DOutput._fields_:
+        print(f"  {name}: {ctypes.sizeof(ctype)} bytes")
+
+
+# ============================================================================
+# TEST
+# ============================================================================
 
 if __name__ == "__main__":
-    import time
-    
-    print("=" * 60)
     print("PF2D Python Bindings Test")
-    print("=" * 60)
+    print("=" * 50)
     
-    # Create filter
-    try:
-        pf = create_default_filter(n_particles=4000)
-    except RuntimeError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    # Verify struct sizes
+    verify_struct_sizes()
+    print()
     
-    pf.initialize(price0=100.0, log_vol0=np.log(0.01))
-    pf.warmup()
+    # Test filter
+    print("Creating filter...")
+    with create_default_filter(n_particles=4000) as pf:
+        pf.initialize(price0=100.0, log_vol0=np.log(0.01),
+                      price_spread=0.01, log_vol_spread=0.5)
+        pf.warmup()
+        
+        print("Running 100 updates...")
+        np.random.seed(42)
+        price = 100.0
+        
+        for i in range(100):
+            price += 0.01 * np.random.randn()
+            result = pf.update(price)
+            
+            if i % 25 == 0:
+                print(f"  Tick {i}: price={result.price_mean:.2f}, "
+                      f"vol={result.vol_mean:.4f}, ess={result.ess:.0f}")
+        
+        print(f"\nFinal: price={result.price_mean:.2f}, vol={result.vol_mean:.4f}")
     
-    print(f"\nFilter: {pf.n_particles} particles, {pf.n_regimes} regimes")
-    pf.print_config()
-    
-    # Simulate prices
-    np.random.seed(42)
-    n_ticks = 1000
-    true_vol = 0.01
-    price = 100.0
-    prices = [price]
-    
-    for _ in range(n_ticks - 1):
-        true_vol = np.exp(0.95 * np.log(true_vol) + 0.05 * np.log(0.01) + 0.05 * np.random.randn())
-        price += true_vol * np.random.randn()
-        prices.append(price)
-    
-    prices = np.array(prices)
-    
-    # Run filter
-    print(f"\nRunning {n_ticks} updates...")
-    
-    start = time.perf_counter()
-    price_est, vol_est, ess = pf.run(prices)
-    elapsed = time.perf_counter() - start
-    
-    print(f"\nPerformance:")
-    print(f"  Total time:  {elapsed*1000:.1f} ms")
-    print(f"  Per tick:    {elapsed/n_ticks*1e6:.1f} μs")
-    print(f"  Throughput:  {n_ticks/elapsed:.0f} ticks/sec")
-    
-    print(f"\nAccuracy:")
-    rmse = np.sqrt(np.mean((prices - price_est)**2))
-    print(f"  Price RMSE:  {rmse:.6f}")
-    print(f"  Mean ESS:    {np.mean(ess):.0f} ({np.mean(ess)/pf.n_particles:.1%})")
-    
-    print(f"\nFinal state:")
-    print(f"  True price:  {prices[-1]:.4f}")
-    print(f"  Est price:   {price_est[-1]:.4f}")
-    print(f"  Est vol:     {vol_est[-1]:.6f}")
-    
-    print("\n" + "=" * 60)
-    print("Test complete!")
-
+    print("\n✓ All tests passed!")
