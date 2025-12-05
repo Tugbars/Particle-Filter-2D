@@ -273,6 +273,9 @@ typedef double pf2d_real;
         pf2d_real base_bandwidth_price;
         pf2d_real base_bandwidth_vol;
 
+        pf2d_real inv_n_particles;      /* Precomputed 1.0/n_particles */
+
+
         /*====================================================================
          * FEATURE FLAGS
          *====================================================================*/
