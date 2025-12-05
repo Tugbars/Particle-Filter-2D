@@ -1,4 +1,4 @@
-# 2D Particle Filter with Stochastic Volatility
+# PF2D: Self-Calibrating Particle Filter with PMMH
 
 High-performance particle filter implementation in C with Intel MKL acceleration. Tracks a 2D latent state `[price, log_volatility]` using Sequential Monte Carlo methods.
 
