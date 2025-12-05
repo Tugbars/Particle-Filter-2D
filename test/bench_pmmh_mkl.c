@@ -211,11 +211,27 @@ static void generate_sv_data(double *returns, int n,
  *============================================================================*/
 
 int main(int argc, char **argv) {
+    (void)argc; (void)argv;  /* Unused */
+    
+#if HAS_MKL
+    /* CRITICAL: MKL internal ops (vdExp, vdRng) should be single-threaded.
+     * Vector sizes (256-512) are too small to benefit from threading.
+     * Parallelism happens at chain level via OpenMP. */
+    mkl_set_num_threads(1);
+    mkl_set_dynamic(0);
+    
+    /* OpenMP threads for parallel chains */
+    omp_set_num_threads(16);
+    
+    printf("MKL: sequential (small vectors)\n");
+    printf("OMP: 16 threads (parallel chains)\n\n");
+#endif
+    
     printf("╔═══════════════════════════════════════════════════════════════════╗\n");
     printf("║           PMMH BENCHMARK: Scalar vs MKL                           ║\n");
     printf("╠═══════════════════════════════════════════════════════════════════╣\n");
     printf("║ MKL:        %s                                                   ║\n", HAS_MKL ? "ENABLED" : "DISABLED");
-    printf("║ Threads:    %-3d                                                   ║\n", omp_get_max_threads());
+    printf("║ OMP Threads: %-3d                                                  ║\n", omp_get_max_threads());
     printf("╚═══════════════════════════════════════════════════════════════════╝\n\n");
     
     /* Configuration */
@@ -276,7 +292,8 @@ int main(int argc, char **argv) {
         PMMHResult mkl_res;
         
         for (int run = 0; run < n_runs; run++) {
-            pmmh_run_mkl(returns, n_obs, &prior, theta_vol, n_iter, n_burn, np, &mkl_res);
+            pmmh_run_mkl(returns, n_obs, &prior, theta_vol, n_iter, n_burn, np, 
+                         12345 + run, &mkl_res);
             mkl_total_ms += mkl_res.elapsed_ms;
             mkl_mu_err += fabs(mkl_res.posterior_mean.mu_vol - true_mu_vol);
         }
@@ -296,24 +313,28 @@ int main(int argc, char **argv) {
     printf("└──────────┴─────────────────┴────────────────┴─────────┴────────────┘\n");
     
 #if HAS_MKL
-    /* Test parallel chains */
+    /* Test parallel chains - use all P-core threads */
+    int n_chains = 16;  /* 8 P-cores × 2 HT = 16 threads */
+    
     printf("\n┌──────────────────────────────────────────────────────────────────┐\n");
-    printf("│ PARALLEL CHAINS TEST (256 particles, 4 chains)                   │\n");
+    printf("│ PARALLEL CHAINS TEST (256 particles, %d chains)                  │\n", n_chains);
     printf("├──────────────────────────────────────────────────────────────────┤\n");
     
     PMMHParallelResult par_res;
-    pmmh_run_parallel(returns, n_obs, &prior, theta_vol, n_iter, n_burn, 256, 4, &par_res);
+    pmmh_run_parallel(returns, n_obs, &prior, theta_vol, n_iter, n_burn, 256, n_chains, &par_res);
     
     PMMHResult agg;
     pmmh_parallel_aggregate(&par_res, &agg);
     
     printf("│ Total time:      %8.1f ms                                     │\n", par_res.total_elapsed_ms);
-    printf("│ Per-chain avg:   %8.1f ms                                     │\n", par_res.total_elapsed_ms / 4);
+    printf("│ Per-chain avg:   %8.1f ms                                     │\n", par_res.total_elapsed_ms / n_chains);
     printf("│ Posterior μ_v:   %8.3f (true: %.3f, err: %.3f)               │\n",
            agg.posterior_mean.mu_vol, true_mu_vol, 
            fabs(agg.posterior_mean.mu_vol - true_mu_vol));
     printf("│ Cross-chain std: %8.4f                                        │\n", agg.posterior_std.mu_vol);
     printf("│ Acceptance rate: %8.1f%%                                       │\n", agg.acceptance_rate * 100);
+    printf("│ Effective samples: %d (16 chains × %d post-burnin)             │\n", 
+           agg.n_samples, (n_iter - n_burn));
     printf("└──────────────────────────────────────────────────────────────────┘\n");
     
     pmmh_parallel_free(&par_res);
