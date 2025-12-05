@@ -359,6 +359,44 @@ endif()
 
 add_test(NAME realistic_scenario_tests COMMAND test_realistic_scenarios)
 
+# PMMH MKL benchmark - compares scalar vs MKL performance
+add_executable(bench_pmmh_mkl
+    test/bench_pmmh_mkl.c
+)
+
+target_compile_options(bench_pmmh_mkl PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O3 -march=native>
+)
+
+# MKL version - full performance
+target_compile_definitions(bench_pmmh_mkl PRIVATE USE_MKL)
+target_include_directories(bench_pmmh_mkl PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/2D
+)
+target_link_libraries(bench_pmmh_mkl PRIVATE
+    MKL::MKL
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:OpenMP::OpenMP_C>
+)
+
+if(UNIX)
+    target_link_libraries(bench_pmmh_mkl PRIVATE m pthread dl)
+endif()
+
+# Also build scalar-only version for comparison
+add_executable(bench_pmmh_scalar
+    test/bench_pmmh_mkl.c
+)
+
+target_compile_options(bench_pmmh_scalar PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O3 -march=native>
+)
+
+if(UNIX)
+    target_link_libraries(bench_pmmh_scalar PRIVATE m)
+endif()
+
 #───────────────────────────────────────────────────────────────────────────────
 # Install
 #───────────────────────────────────────────────────────────────────────────────
