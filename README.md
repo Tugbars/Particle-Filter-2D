@@ -1,6 +1,7 @@
 # PF2D: Self-Calibrating Particle Filter with PMMH
 
 High-performance particle filter in C with Intel MKL acceleration. 27× faster than FilterPy (NumPy golden standard). Features self-calibration via ESS-driven adaptation, online parameter re-estimation via PMMH, and automatic CPU profiling for Intel hybrid architectures (P-core/E-core optimization).
+Tracks a 2D latent state [price, log_volatility] using Sequential Monte Carlo methods.
 
 ## Performance
 
