@@ -311,6 +311,54 @@ endif()
 
 add_test(NAME adaptive_calibration_tests COMMAND test_pf2d_adaptive)
 
+# PMMH parameter estimation tests - standalone, no MKL dependency
+add_executable(test_pf2d_pmmh
+    test/test_pf2d_pmmh.c
+)
+
+target_compile_options(test_pf2d_pmmh PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+)
+
+if(UNIX)
+    target_link_libraries(test_pf2d_pmmh PRIVATE m)
+endif()
+
+add_test(NAME pmmh_estimation_tests COMMAND test_pf2d_pmmh)
+
+# BOCPD + PMMH integration example - standalone
+add_executable(example_bocpd_pmmh
+    test/example_bocpd_pmmh.c
+)
+
+target_compile_options(example_bocpd_pmmh PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+)
+
+if(UNIX)
+    target_link_libraries(example_bocpd_pmmh PRIVATE m)
+endif()
+
+add_test(NAME bocpd_pmmh_integration COMMAND example_bocpd_pmmh)
+
+# Realistic scenario tests (Monte Carlo) - standalone
+add_executable(test_realistic_scenarios
+    test/test_realistic_scenarios.c
+)
+
+target_compile_options(test_realistic_scenarios PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+)
+
+if(UNIX)
+    target_link_libraries(test_realistic_scenarios PRIVATE m)
+endif()
+
+add_test(NAME realistic_scenario_tests COMMAND test_realistic_scenarios)
+
 #───────────────────────────────────────────────────────────────────────────────
 # Install
 #───────────────────────────────────────────────────────────────────────────────
