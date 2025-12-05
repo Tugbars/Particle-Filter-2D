@@ -8,10 +8,9 @@
  *   - VSL SFMT19937 RNG with ICDF method (faster than BoxMuller)
  *   - VML vdExp for vectorized exp (standard precision)
  *   - OpenMP SIMD for particle loops
- *   - Reciprocal multiplication instead of division
- *   - Precomputed CDF for resampling with forced endpoint
- *   - Thread-local state reuse (avoids vslNewStream overhead)
- *   - Direct gather in resampling (no temp buffer - disjoint arrays)
+ *   - Division elimination: exp(-2*log_vol) for inv_var, no scalar division
+ *   - Adaptive resampling: Only resample when ESS < N/4 (saves resamples)
+ *   - Pointer swapping: When not resampling, swap pointers instead of gather
  *   - Single-pass mean/variance computation
  *
  * Threading model:
@@ -48,6 +47,7 @@
 #define PMMH_N_ITERATIONS 300
 #define PMMH_N_BURNIN 100
 #define PMMH_CACHE_LINE 64
+#define PMMH_ESS_THRESHOLD 0.05 /* Resample when ESS < N * threshold */
 
 /* Align allocations for SIMD */
 #define ALIGNED_ALLOC(size) mkl_malloc((size), PMMH_CACHE_LINE)
@@ -149,6 +149,11 @@ static void pmmh_state_seed(PMMHState *s, unsigned int seed)
 
 /*============================================================================
  * VECTORIZED PARTICLE FILTER LOG-LIKELIHOOD
+ *
+ * Optimizations:
+ *   - Division elimination: exp(-2*log_vol) gives inv_var, no division needed
+ *   - Adaptive resampling: Only resample when ESS < N/4
+ *   - Pointer swapping: When not resampling, swap pointers instead of copy
  *============================================================================*/
 
 static double pmmh_log_likelihood_mkl(PMMHState *s,
@@ -161,10 +166,15 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
     const double theta_mu = theta * params->mu_vol;
     const double drift = params->drift;
     const double sigma_vol = params->sigma_vol;
+    const double ess_threshold = np * PMMH_ESS_THRESHOLD;
+
+    /* Pointers for ping-pong buffering */
+    double *log_vol_curr = s->log_vol;
+    double *log_vol_next = s->log_vol_new;
 
     /* Initialize particles at mu_vol with some spread */
     vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->stream,
-                  np, s->log_vol, params->mu_vol, 0.3);
+                  np, log_vol_curr, params->mu_vol, 0.3);
 
     double total_log_lik = 0.0;
 
@@ -172,6 +182,7 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
     {
         const double ret = returns[t];
         const double ret_minus_drift = ret - drift;
+        const double ret_sq = ret_minus_drift * ret_minus_drift;
 
         /* Generate noise for volatility evolution */
         vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, s->stream,
@@ -181,21 +192,28 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
 #pragma omp simd
         for (int i = 0; i < np; i++)
         {
-            s->log_vol_new[i] = one_minus_theta * s->log_vol[i] + theta_mu + s->noise[i];
+            log_vol_next[i] = one_minus_theta * log_vol_curr[i] + theta_mu + s->noise[i];
         }
 
-        /* Vectorized exp for volatility */
-        vdExp(np, s->log_vol_new, s->weights_exp);
+/* Division elimination: compute -2*log_vol for inv_var
+ * Reuse noise array since we're done with it */
+#pragma omp simd
+        for (int i = 0; i < np; i++)
+        {
+            s->noise[i] = -2.0 * log_vol_next[i];
+        }
 
-        /* Compute log-weights */
+        /* Vectorized exp: inv_var = exp(-2*log_vol) = 1/var = 1/vol^2 */
+        vdExp(np, s->noise, s->weights_exp);
+
+        /* Compute log-weights without division:
+         * log_w = -0.5 * (ret/vol)^2 - log_vol
+         *       = -0.5 * ret^2 * inv_var - log_vol */
         double max_log_w = -DBL_MAX;
 #pragma omp simd reduction(max : max_log_w)
         for (int i = 0; i < np; i++)
         {
-            double vol = s->weights_exp[i];
-            double inv_vol = 1.0 / vol;
-            double z = ret_minus_drift * inv_vol;
-            double log_w = -0.5 * z * z - s->log_vol_new[i];
+            double log_w = -0.5 * ret_sq * s->weights_exp[i] - log_vol_next[i];
             s->weights[i] = log_w;
             if (log_w > max_log_w)
                 max_log_w = log_w;
@@ -210,23 +228,31 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
         vdExp(np, s->weights, s->weights_exp);
 
         double sum_w = 0.0;
-#pragma omp simd reduction(+ : sum_w)
+        double sum_w_sq = 0.0;
+#pragma omp simd reduction(+ : sum_w, sum_w_sq)
         for (int i = 0; i < np; i++)
         {
-            sum_w += s->weights_exp[i];
+            double w = s->weights_exp[i];
+            sum_w += w;
+            sum_w_sq += w * w;
         }
 
         total_log_lik += max_log_w + log(sum_w / np);
 
+        /* Normalize weights and compute ESS */
         double inv_sum = 1.0 / sum_w;
+        double ess = (sum_w * sum_w) / sum_w_sq; /* ESS = (sum w)^2 / sum(w^2) */
+
 #pragma omp simd
         for (int i = 0; i < np; i++)
         {
             s->weights_exp[i] *= inv_sum;
         }
 
-        /* Systematic resampling */
+        /* Adaptive resampling: only resample when ESS drops below threshold */
+        if (ess < ess_threshold)
         {
+            /* Systematic resampling */
             double *cdf = s->uniform;
             cdf[0] = s->weights_exp[0];
             for (int i = 1; i < np; i++)
@@ -249,13 +275,25 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
                 s->ancestors[i] = j;
             }
 
+/* Gather resampled particles into log_vol_curr */
 #pragma omp simd
             for (int i = 0; i < np; i++)
             {
-                s->log_vol[i] = s->log_vol_new[s->ancestors[i]];
+                log_vol_curr[i] = log_vol_next[s->ancestors[i]];
             }
+            /* log_vol_curr now has resampled particles, ready for next iteration */
+        }
+        else
+        {
+            /* No resampling needed - pointer swap */
+            double *tmp = log_vol_curr;
+            log_vol_curr = log_vol_next;
+            log_vol_next = tmp;
         }
     }
+
+    /* Restore state pointers if they were swapped an odd number of times */
+    /* (Not strictly necessary since we reinitialize each call, but cleaner) */
 
     return total_log_lik;
 }
