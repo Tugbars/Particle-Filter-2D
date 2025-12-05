@@ -1,25 +1,21 @@
 # PF2D: Self-Calibrating Particle Filter with PMMH
 
-High-performance particle filter in C with Intel MKL acceleration. 27× faster than FilterPy (NumPy golden standard). Features self-calibration via ESS-driven adaptation, online parameter re-estimation via PMMH, and automatic CPU profiling for Intel hybrid architectures (P-core/E-core optimization).
-Tracks a 2D latent state [price, log_volatility] using Sequential Monte Carlo methods.
+High-performance particle filter in C with Intel MKL acceleration. **41× faster than FilterPy** (NumPy golden standard). Features self-calibration via ESS-driven adaptation, online parameter re-estimation via PMMH, and automatic CPU profiling for Intel hybrid architectures (P-core/E-core optimization).
 
-## Performance
+Tracks a 2D latent state `[price, log_volatility]` using Sequential Monte Carlo methods.
 
-**28 μs/tick @ 36,000 ticks/sec** on Intel i9-14900KF (8 P-cores, 16 threads)
+## Benchmark Results
 
-| Metric | Value |
-|--------|-------|
-| Mean latency | 28 μs/tick |
-| P50 latency | 13 μs/tick |
-| Throughput | 36,000 ticks/sec |
+Tested on Intel i9-14900KF (8 P-cores, 16 threads), 4000 particles, 1000 ticks:
 
-### vs Other Implementations
+| Library | Latency (μs) | Throughput | vs pf2d |
+|---------|--------------|------------|---------|
+| **pf2d (batch)** | **17.2** | **58,188/sec** | baseline |
+| pf2d (loop) | 17.9 | 55,751/sec | 1.0× slower |
+| particles (Chopin) | 211.4 | 4,730/sec | 12.3× slower |
+| FilterPy (NumPy) | 710.9 | 1,407/sec | 41.4× slower |
 
-| Implementation | Latency | vs PF2D |
-|----------------|---------|---------|
-| **pf2d (C/MKL)** | 28 μs | baseline |
-| FilterPy (NumPy) | 744 μs | 27× slower |
-| particles (academic) | ~1-2 ms | ~40-70× slower |
+**→ pf2d is 41× faster than FilterPy and 12× faster than the academic reference implementation.**
 
 ---
 
@@ -34,7 +30,7 @@ Tracks a 2D latent state [price, log_volatility] using Sequential Monte Carlo me
 | Self-calibration | ✗ | ✓ (ESS-driven σ_vol scaling) |
 | Online parameter updates | Manual/offline | ✓ (PMMH) |
 
-PF2D is essentially:
+PF2D is essentially a **better UKF** that:
 - Makes no Gaussian assumptions
 - Handles regime switching natively
 - Self-calibrates via adaptive layer
