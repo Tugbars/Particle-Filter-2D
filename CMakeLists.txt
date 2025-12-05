@@ -344,20 +344,45 @@ endif()
 add_test(NAME bocpd_pmmh_integration COMMAND example_bocpd_pmmh)
 
 # Realistic scenario tests (Monte Carlo) - standalone
+# Realistic scenario tests - MKL optimized
 add_executable(test_realistic_scenarios
     test/test_realistic_scenarios.c
 )
 
 target_compile_options(test_realistic_scenarios PRIVATE
-    $<$<C_COMPILER_ID:MSVC>:/W4>
-    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+    $<$<C_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O3 -march=native>
+)
+
+# Use MKL-optimized PMMH
+target_compile_definitions(test_realistic_scenarios PRIVATE USE_MKL)
+target_include_directories(test_realistic_scenarios PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/2D
+)
+target_link_libraries(test_realistic_scenarios PRIVATE
+    MKL::MKL
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:OpenMP::OpenMP_C>
 )
 
 if(UNIX)
-    target_link_libraries(test_realistic_scenarios PRIVATE m)
+    target_link_libraries(test_realistic_scenarios PRIVATE m pthread dl)
 endif()
 
 add_test(NAME realistic_scenario_tests COMMAND test_realistic_scenarios)
+
+# Also build scalar-only version for comparison (optional)
+add_executable(test_realistic_scenarios_scalar
+    test/test_realistic_scenarios.c
+)
+
+target_compile_options(test_realistic_scenarios_scalar PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O3 -march=native>
+)
+
+if(UNIX)
+    target_link_libraries(test_realistic_scenarios_scalar PRIVATE m)
+endif()
 
 # PMMH MKL benchmark - compares scalar vs MKL performance
 add_executable(bench_pmmh_mkl

@@ -8,13 +8,22 @@
  *   3. Earnings gap (overnight gap, elevated vol)
  *   4. Liquidity crisis (persistent high vol, negative drift)
  *   5. Gradual regime shift (slow transition)
+ *   6. Overnight gap (gap opening from news)
+ *   7. Intraday pattern (lunch lull → power hour)
+ *   8. Correlation spike (stress event)
+ *   9. Oscillating regimes (low→high→low vol)
+ *  10. Pre-crisis buildup (trending vol / VIX creep)
  *
  * Each scenario runs Monte Carlo simulations to validate:
  *   - Detection delay distribution
  *   - False positive rate
  *   - Parameter recovery accuracy
  *
- * Compile: gcc -O2 test_realistic_scenarios.c -o test_scenarios -lm
+ * Compile (MKL - recommended):
+ *   Requires: CMake build with MKL linkage
+ *
+ * Compile (scalar fallback):
+ *   gcc -O3 -march=native test_realistic_scenarios.c -o test_scenarios -lm
  */
 
 #include <stdio.h>
@@ -22,6 +31,17 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+
+/*============================================================================
+ * MKL CONFIGURATION
+ *============================================================================*/
+
+#ifdef USE_MKL
+#include "pmmh_mkl.h"
+#define HAS_MKL 1
+#else
+#define HAS_MKL 0
+#endif
 
 /*============================================================================
  * CONFIGURATION
@@ -39,7 +59,7 @@
 #define PMMH_WINDOW 150
 
 #ifndef PMMH_PARTICLES
-#define PMMH_PARTICLES 128 /* Override with -DPMMH_PARTICLES=256 */
+#define PMMH_PARTICLES 256 /* Default 256 for MKL */
 #endif
 
 /*============================================================================
@@ -339,6 +359,145 @@ static Scenario scenario_gradual_shift(void)
         .has_second_change = 0};
 }
 
+/* Scenario 6: Overnight Gap */
+static Scenario scenario_overnight_gap(void)
+{
+    SVParams normal = sv_normal_market();
+
+    /* Gap opening: single large move + elevated vol */
+    SVParams gap = sv_normal_market();
+    gap.drift = 0.003; /* Strong positive drift from gap */
+    gap.mu_vol = -2.8; /* High vol on gap */
+    gap.sigma_vol = 0.12;
+    gap.jump_intensity = 0.02; /* Some follow-through jumps */
+
+    /* Post-gap: elevated vol slowly normalizing */
+    SVParams post_gap = sv_normal_market();
+    post_gap.mu_vol = -3.5;    /* Still elevated */
+    post_gap.theta_vol = 0.03; /* Faster mean reversion back to normal */
+
+    return (Scenario){
+        .name = "Overnight Gap",
+        .description = "Gap opening from overnight news, then normalization",
+        .changepoint = 300,
+        .transition_ticks = 0, /* Instant gap */
+        .before = normal,
+        .after = gap,
+        .has_second_change = 1,
+        .second_changepoint = 320, /* Quick transition to post-gap */
+        .final = post_gap};
+}
+
+/* Scenario 7: Intraday Pattern (Lunch Lull → Power Hour) */
+static Scenario scenario_intraday_pattern(void)
+{
+    /* Morning: normal trading */
+    SVParams morning = sv_normal_market();
+    morning.mu_vol = -3.8;
+
+    /* Lunch lull: very low vol */
+    SVParams lunch = sv_normal_market();
+    lunch.mu_vol = -4.8;    /* Much lower vol */
+    lunch.sigma_vol = 0.03; /* Very stable */
+    lunch.drift = 0.0;      /* No directional bias */
+
+    /* Power hour: increased vol and activity */
+    SVParams power_hour = sv_normal_market();
+    power_hour.mu_vol = -3.2; /* Higher vol */
+    power_hour.sigma_vol = 0.10;
+    power_hour.drift = 0.0002; /* Slight positive bias */
+
+    return (Scenario){
+        .name = "Intraday Pattern",
+        .description = "Lunch lull followed by power hour vol spike",
+        .changepoint = 300,     /* Lunch starts */
+        .transition_ticks = 20, /* Gradual quiet */
+        .before = morning,
+        .after = lunch,
+        .has_second_change = 1,
+        .second_changepoint = 500, /* Power hour starts */
+        .final = power_hour};
+}
+
+/* Scenario 8: Correlation Spike (Stress Event) */
+static Scenario scenario_correlation_spike(void)
+{
+    /* Normal: moderate vol, low correlation regime */
+    SVParams normal = sv_normal_market();
+    normal.rho = -0.3; /* Normal leverage effect */
+
+    /* Stress: high vol, high correlation (everything moves together) */
+    SVParams stress = sv_crisis();
+    stress.rho = -0.8;       /* Strong leverage */
+    stress.mu_vol = -2.5;    /* Very high vol */
+    stress.sigma_vol = 0.15; /* Vol-of-vol spikes */
+    stress.jump_intensity = 0.03;
+
+    return (Scenario){
+        .name = "Correlation Spike",
+        .description = "Stress event with correlation breakdown",
+        .changepoint = 350,
+        .transition_ticks = 10, /* Fast onset */
+        .before = normal,
+        .after = stress,
+        .has_second_change = 0 /* Persistent stress */
+    };
+}
+
+/* Scenario 9: Multiple Regime Changes (Oscillating) */
+static Scenario scenario_oscillating(void)
+{
+    /* Low vol regime */
+    SVParams low_vol = sv_normal_market();
+    low_vol.mu_vol = -4.5;
+    low_vol.sigma_vol = 0.04;
+
+    /* High vol regime */
+    SVParams high_vol = sv_normal_market();
+    high_vol.mu_vol = -3.0;
+    high_vol.sigma_vol = 0.12;
+
+    /* Note: This scenario tests detector's ability to detect multiple changes
+     * We'll use the basic two-change structure, but the key test is
+     * whether the detector can catch the first change quickly */
+    return (Scenario){
+        .name = "Oscillating Regimes",
+        .description = "Low→High→Low vol oscillation",
+        .changepoint = 250,
+        .transition_ticks = 0,
+        .before = low_vol,
+        .after = high_vol,
+        .has_second_change = 1,
+        .second_changepoint = 450,
+        .final = low_vol /* Back to low vol */
+    };
+}
+
+/* Scenario 10: Pre-Crisis Buildup (Trending Vol) */
+static Scenario scenario_trending_vol(void)
+{
+    /* Calm before storm */
+    SVParams calm = sv_normal_market();
+    calm.mu_vol = -4.5;
+    calm.sigma_vol = 0.03;
+
+    /* Building stress - gradually increasing vol */
+    SVParams building = sv_normal_market();
+    building.mu_vol = -3.0; /* Much higher vol */
+    building.sigma_vol = 0.10;
+    building.theta_vol = 0.005; /* Very slow mean reversion */
+    building.drift = -0.0001;   /* Slight negative drift */
+
+    return (Scenario){
+        .name = "Pre-Crisis Buildup",
+        .description = "Gradually increasing vol (VIX creep)",
+        .changepoint = 200,
+        .transition_ticks = 300, /* Very slow buildup over 300 ticks */
+        .before = calm,
+        .after = building,
+        .has_second_change = 0};
+}
+
 /*============================================================================
  * DATA GENERATION
  *============================================================================*/
@@ -536,26 +695,55 @@ static int detector_update(Detector *d, double x, int t, double *ratio_out)
 }
 
 /*============================================================================
- * PMMH (simplified for testing)
+ * PMMH IMPLEMENTATION
+ *
+ * Uses MKL-optimized version when available, scalar fallback otherwise
  *============================================================================*/
 
-typedef struct
-{
-    double drift, mu_vol, sigma_vol;
-} PMMHParams;
+#if HAS_MKL
 
-typedef struct
-{
-    PMMHParams mean, std;
-} PMMHPrior;
+/* Use MKL types directly - they're compatible */
+typedef PMMHParams ScenarioPMMHParams;
+typedef PMMHPrior ScenarioPMMHPrior;
 
 typedef struct
 {
     PMMHParams posterior;
     double acceptance_rate;
-} PMMHResult;
+} ScenarioPMMHResult;
 
-static double pmmh_log_lik(const double *ret, int n, const PMMHParams *p, double theta)
+static void scenario_pmmh_run(const double *ret, int n, const ScenarioPMMHPrior *prior,
+                              double theta, int n_iter, int n_burn, ScenarioPMMHResult *res)
+{
+    PMMHResult mkl_result;
+
+    /* Run MKL-optimized PMMH */
+    pmmh_run_mkl(ret, n, prior, theta, n_iter, n_burn, PMMH_PARTICLES,
+                 (unsigned int)(rng_next() & 0xFFFFFFFF), &mkl_result);
+
+    res->posterior = mkl_result.posterior_mean;
+    res->acceptance_rate = mkl_result.acceptance_rate;
+}
+
+#else /* Scalar fallback */
+
+typedef struct
+{
+    double drift, mu_vol, sigma_vol;
+} ScenarioPMMHParams;
+
+typedef struct
+{
+    ScenarioPMMHParams mean, std;
+} ScenarioPMMHPrior;
+
+typedef struct
+{
+    ScenarioPMMHParams posterior;
+    double acceptance_rate;
+} ScenarioPMMHResult;
+
+static double pmmh_log_lik(const double *ret, int n, const ScenarioPMMHParams *p, double theta)
 {
     int np = PMMH_PARTICLES;
     double *lv = (double *)malloc(np * sizeof(double));
@@ -591,22 +779,27 @@ static double pmmh_log_lik(const double *ret, int n, const PMMHParams *p, double
         }
         ll += max_lw + log(sum_w / np);
 
-        /* Resample */
-        double *tmp = (double *)malloc(np * sizeof(double));
+        /* Systematic resampling */
+        double u = randu() / np;
+        double cumsum = 0;
+        int j = 0;
+        double *tmp = lv;
+        lv = lv2;
+        lv2 = tmp;
+
         for (int i = 0; i < np; i++)
         {
-            double u = randu() * sum_w;
-            double cum = 0;
-            int j = 0;
-            while (j < np - 1 && cum + w[j] < u)
+            double target = u + (double)i / np;
+            while (cumsum + w[j] / sum_w < target && j < np - 1)
             {
-                cum += w[j];
+                cumsum += w[j] / sum_w;
                 j++;
             }
-            tmp[i] = lv2[j];
+            lv2[i] = lv[j];
         }
-        memcpy(lv, tmp, np * sizeof(double));
-        free(tmp);
+        tmp = lv;
+        lv = lv2;
+        lv2 = tmp;
     }
 
     free(lv);
@@ -615,10 +808,10 @@ static double pmmh_log_lik(const double *ret, int n, const PMMHParams *p, double
     return ll;
 }
 
-static void pmmh_run(const double *ret, int n, const PMMHPrior *prior,
-                     double theta, int n_iter, int n_burn, PMMHResult *res)
+static void scenario_pmmh_run(const double *ret, int n, const ScenarioPMMHPrior *prior,
+                              double theta, int n_iter, int n_burn, ScenarioPMMHResult *res)
 {
-    PMMHParams cur = prior->mean;
+    ScenarioPMMHParams cur = prior->mean;
     double cur_ll = pmmh_log_lik(ret, n, &cur, theta);
 
     int n_acc = 0;
@@ -627,9 +820,9 @@ static void pmmh_run(const double *ret, int n, const PMMHPrior *prior,
 
     for (int it = 0; it < n_iter; it++)
     {
-        PMMHParams prop;
+        ScenarioPMMHParams prop;
         prop.drift = cur.drift + randn() * 0.0004;
-        prop.mu_vol = cur.mu_vol + randn() * 0.08; /* Wider exploration */
+        prop.mu_vol = cur.mu_vol + randn() * 0.08;
         prop.sigma_vol = cur.sigma_vol * exp(randn() * 0.05);
 
         prop.drift = fmax(-0.01, fmin(0.01, prop.drift));
@@ -659,6 +852,8 @@ static void pmmh_run(const double *ret, int n, const PMMHPrior *prior,
     res->posterior.sigma_vol = sum_s / n_samples;
     res->acceptance_rate = (double)n_acc / n_iter;
 }
+
+#endif /* HAS_MKL */
 
 /*============================================================================
  * MONTE CARLO EVALUATION
@@ -740,17 +935,17 @@ static void run_scenario_monte_carlo(const Scenario *s, int n_runs, MCStats *sta
         if (detection_time >= 0 && detection_time + PMMH_WINDOW < N_OBSERVATIONS)
         {
             /* Use more neutral prior - not centered on regime 1 */
-            PMMHPrior prior;
-            prior.mean = (PMMHParams){
+            ScenarioPMMHPrior prior;
+            prior.mean = (ScenarioPMMHParams){
                 0.0,  /* Neutral drift */
                 -3.5, /* Middle-ground μ_vol (between -4 and -2.5) */
                 0.08  /* Moderate σ_vol */
             };
-            prior.std = (PMMHParams){0.003, 1.0, 0.8}; /* Wider std, especially for μ_vol */
+            prior.std = (ScenarioPMMHParams){0.003, 1.0, 0.8}; /* Wider std, especially for μ_vol */
 
-            PMMHResult res;
-            pmmh_run(&returns[detection_time], PMMH_WINDOW, &prior,
-                     s->after.theta_vol, PMMH_ITERATIONS, PMMH_BURNIN, &res);
+            ScenarioPMMHResult res;
+            scenario_pmmh_run(&returns[detection_time], PMMH_WINDOW, &prior,
+                              s->after.theta_vol, PMMH_ITERATIONS, PMMH_BURNIN, &res);
 
             /* Compare to true post-change params */
             double true_mu = s->after.mu_vol;
@@ -827,10 +1022,21 @@ static void print_scenario_results(const Scenario *s, const MCStats *stats)
 
 int main(void)
 {
+#if HAS_MKL
+    /* Configure MKL: single-threaded internals, parallel at scenario level */
+    mkl_set_num_threads(1);
+    mkl_set_dynamic(0);
+#endif
+
     printf("╔═════════════════════════════════════════════════════════════════╗\n");
     printf("║     REALISTIC SCENARIO TESTS: BOCPD + PMMH INTEGRATION          ║\n");
     printf("║                                                                 ║\n");
     printf("║  Monte Carlo: %d runs, Particles: %d                            ║\n", N_MONTE_CARLO, PMMH_PARTICLES);
+#if HAS_MKL
+    printf("║  Backend: MKL (optimized)                                       ║\n");
+#else
+    printf("║  Backend: Scalar (fallback)                                     ║\n");
+#endif
     printf("╚═════════════════════════════════════════════════════════════════╝\n");
 
     Scenario scenarios[] = {
@@ -838,10 +1044,15 @@ int main(void)
         scenario_fed_announcement(),
         scenario_earnings_gap(),
         scenario_liquidity_crisis(),
-        scenario_gradual_shift()};
+        scenario_gradual_shift(),
+        scenario_overnight_gap(),
+        scenario_intraday_pattern(),
+        scenario_correlation_spike(),
+        scenario_oscillating(),
+        scenario_trending_vol()};
     int n_scenarios = sizeof(scenarios) / sizeof(scenarios[0]);
 
-    MCStats all_stats[5];
+    MCStats all_stats[10];
 
     for (int i = 0; i < n_scenarios; i++)
     {

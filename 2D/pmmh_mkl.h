@@ -3,17 +3,22 @@
  * @brief High-performance PMMH using Intel MKL
  *
  * Optimizations:
- *   - VSL Philox RNG (thread-safe, reproducible, counter-based)
- *   - VML for vectorized exp/log with VML_EP mode (faster, ~1% error)
+ *   - Arena allocation: Single contiguous block for particle arrays (better dTLB)
+ *   - VSL SFMT19937 RNG (SIMD-optimized Mersenne Twister)
+ *   - VML vdExp for vectorized exp (standard precision)
  *   - OpenMP SIMD for particle loops
- *   - ESS-based adaptive resampling (30-70% fewer resampling ops)
  *   - Reciprocal multiplication instead of division
+ *   - Precomputed CDF for resampling (reduced branch misprediction)
+ *   - Thread-local state reuse (avoids vslNewStream overhead)
  *   - Single-pass mean/variance computation
- *   - SIMD-friendly memory layout (64-byte aligned)
  *
  * Threading model:
  *   - MKL internal: single-threaded (vectors too small to benefit)
- *   - Chain level: OpenMP parallel (16+ threads on P-cores)
+ *   - Chain level: OpenMP parallel with thread-local states
+ *
+ * Memory layout:
+ *   - All particle arrays in single 64-byte aligned arena
+ *   - log_vol, log_vol_new, weights, weights_exp, noise, uniform, ancestors
  *
  * Compile: gcc -O3 -march=native -fopenmp -I${MKLROOT}/include \
  *          pmmh_mkl.c -L${MKLROOT}/lib/intel64 -lmkl_intel_lp64 \
@@ -104,25 +109,33 @@ static PMMHState *pmmh_state_create(int n_particles, double theta_vol)
     s->n_particles = n_particles;
     s->theta_vol = theta_vol;
 
-    /* Allocate aligned particle arrays */
-    s->log_vol = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    s->log_vol_new = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    s->weights = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    s->weights_exp = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    /* Noise buffer - single timestep */
-    s->noise = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    s->uniform = (double *)ALIGNED_ALLOC(n_particles * sizeof(double));
-    s->ancestors = (int *)ALIGNED_ALLOC(n_particles * sizeof(int));
+    /* Arena allocation: single contiguous block for all particle arrays
+     * Benefits: Better dTLB hit rates, prefetching, reduced heap fragmentation */
+    size_t d_size = ((n_particles * sizeof(double) + PMMH_CACHE_LINE - 1) / PMMH_CACHE_LINE) * PMMH_CACHE_LINE; /* Align each array */
+    size_t i_size = ((n_particles * sizeof(int) + PMMH_CACHE_LINE - 1) / PMMH_CACHE_LINE) * PMMH_CACHE_LINE;
+
+    /* 6 double arrays + 1 int array */
+    size_t total_size = 6 * d_size + i_size;
+
+    char *arena = (char *)mkl_malloc(total_size, PMMH_CACHE_LINE);
+    s->log_vol = (double *)(arena + 0 * d_size);
+    s->log_vol_new = (double *)(arena + 1 * d_size);
+    s->weights = (double *)(arena + 2 * d_size);
+    s->weights_exp = (double *)(arena + 3 * d_size);
+    s->noise = (double *)(arena + 4 * d_size);
+    s->uniform = (double *)(arena + 5 * d_size);
+    s->ancestors = (int *)(arena + 6 * d_size);
+
+    /* Store arena base for cleanup */
+    s->n_threads = omp_get_max_threads();
 
     /* Create VSL streams - one per thread */
-    s->n_threads = omp_get_max_threads();
     s->streams = (VSLStreamStatePtr *)malloc(s->n_threads * sizeof(VSLStreamStatePtr));
 
     for (int i = 0; i < s->n_threads; i++)
     {
-        /* Use Philox 4x32x10 - counter-based, thread-safe, reproducible
-         * Supports skip-ahead for parallel generation without stream conflicts */
-        vslNewStream(&s->streams[i], VSL_BRNG_PHILOX4X32X10, 12345 + i * 7919);
+        /* Use SFMT19937 - SIMD-optimized Mersenne Twister, fastest for bulk */
+        vslNewStream(&s->streams[i], VSL_BRNG_SFMT19937, 12345 + i * 7919);
     }
 
     return s;
@@ -139,13 +152,9 @@ static void pmmh_state_destroy(PMMHState *s)
     }
     free(s->streams);
 
-    ALIGNED_FREE(s->log_vol);
-    ALIGNED_FREE(s->log_vol_new);
-    ALIGNED_FREE(s->weights);
-    ALIGNED_FREE(s->weights_exp);
-    ALIGNED_FREE(s->noise);
-    ALIGNED_FREE(s->uniform);
-    ALIGNED_FREE(s->ancestors);
+    /* Single free for arena (log_vol is base pointer) */
+    mkl_free(s->log_vol);
+
     ALIGNED_FREE(s);
 }
 
@@ -154,7 +163,7 @@ static void pmmh_state_seed(PMMHState *s, unsigned int seed)
     for (int i = 0; i < s->n_threads; i++)
     {
         vslDeleteStream(&s->streams[i]);
-        vslNewStream(&s->streams[i], VSL_BRNG_PHILOX4X32X10, seed + i * 7919);
+        vslNewStream(&s->streams[i], VSL_BRNG_SFMT19937, seed + i * 7919);
     }
 }
 
@@ -162,14 +171,12 @@ static void pmmh_state_seed(PMMHState *s, unsigned int seed)
  * VECTORIZED PARTICLE FILTER LOG-LIKELIHOOD
  *
  * Optimizations applied:
- *   1. VML_EP mode for faster exp/log (relaxed precision)
- *   2. Reciprocal multiplication instead of division
- *   3. ESS-based adaptive resampling (skip when particles healthy)
- *   4. Philox RNG for thread-safe parallel generation
+ *   1. SFMT19937 RNG (SIMD-optimized)
+ *   2. vdExp for vectorized exp
+ *   3. Reciprocal multiplication instead of division
+ *   4. SIMD loops with #pragma omp simd
+ *   5. Precomputed CDF for resampling (linear scan with sorted targets)
  *============================================================================*/
-
-/* ESS threshold for adaptive resampling (0.5 = resample when ESS < 50% of N) */
-#define ESS_THRESHOLD 0.5
 
 static double pmmh_log_likelihood_mkl(PMMHState *s,
                                       const double *returns, int n_obs,
@@ -183,9 +190,6 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
     const double sigma_vol = params->sigma_vol;
 
     int tid = omp_get_thread_num();
-
-    /* Set VML to enhanced performance mode (faster, slightly less precise) */
-    vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
 
     /* Initialize particles at mu_vol with some spread */
     vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_BOXMULLER2, s->streams[tid],
@@ -236,15 +240,12 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
         /* Vectorized exp for normalized weights */
         vdExp(np, s->weights, s->weights_exp);
 
-        /* Sum weights and compute ESS */
+        /* Sum weights */
         double sum_w = 0.0;
-        double sum_w_sq = 0.0;
-#pragma omp simd reduction(+ : sum_w, sum_w_sq)
+#pragma omp simd reduction(+ : sum_w)
         for (int i = 0; i < np; i++)
         {
-            double w = s->weights_exp[i];
-            sum_w += w;
-            sum_w_sq += w * w;
+            sum_w += s->weights_exp[i];
         }
 
         total_log_lik += max_log_w + log(sum_w / np);
@@ -257,24 +258,32 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
             s->weights_exp[i] *= inv_sum;
         }
 
-        /* Adaptive resampling: only resample when ESS < threshold */
-        double ess = (sum_w * sum_w) / sum_w_sq;
-
-        if (ess < ESS_THRESHOLD * np)
+        /* Always resample (adaptive resampling was causing accuracy issues) */
         {
-            /* Systematic resampling */
-            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->streams[tid],
-                         1, s->uniform, 0.0, 1.0);
-            double u = s->uniform[0] / np;
-            double cumsum = 0.0;
-            int j = 0;
+            /* Build CDF in-place (reuse uniform buffer) */
+            double *cdf = s->uniform;
+            cdf[0] = s->weights_exp[0];
+            for (int i = 1; i < np; i++)
+            {
+                cdf[i] = cdf[i - 1] + s->weights_exp[i];
+            }
 
+            /* Generate single uniform */
+            double u0;
+            vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, s->streams[tid],
+                         1, &u0, 0.0, 1.0);
+            double inv_np = 1.0 / np;
+            u0 *= inv_np;
+
+            /* Systematic resampling with linear scan
+             * Since targets are sorted and CDF is monotonic, j only increases */
+            int j = 0;
             for (int i = 0; i < np; i++)
             {
-                double target = u + (double)i / np;
-                while (cumsum + s->weights_exp[j] < target && j < np - 1)
+                double target = u0 + i * inv_np;
+                /* Advance j until CDF[j] >= target */
+                while (j < np - 1 && cdf[j] < target)
                 {
-                    cumsum += s->weights_exp[j];
                     j++;
                 }
                 s->ancestors[i] = j;
@@ -284,16 +293,12 @@ static double pmmh_log_likelihood_mkl(PMMHState *s,
 #pragma omp simd
             for (int i = 0; i < np; i++)
             {
-                s->log_vol[i] = s->log_vol_new[s->ancestors[i]];
+                s->noise[i] = s->log_vol_new[s->ancestors[i]]; /* Use noise as temp */
             }
-        }
-        else
-        {
-/* No resampling needed - just copy */
 #pragma omp simd
             for (int i = 0; i < np; i++)
             {
-                s->log_vol[i] = s->log_vol_new[i];
+                s->log_vol[i] = s->noise[i];
             }
         }
     }
@@ -462,7 +467,144 @@ static void pmmh_run_mkl(const double *returns, int n_obs,
 }
 
 /*============================================================================
+ * PMMH WITH EXTERNALLY MANAGED STATE
+ *
+ * For parallel chains: reuse states to avoid vslNewStream overhead
+ *============================================================================*/
+
+static void pmmh_run_mkl_with_state(PMMHState *state,
+                                    const double *returns, int n_obs,
+                                    const PMMHPrior *prior,
+                                    double theta_vol,
+                                    int n_iterations, int n_burnin,
+                                    PMMHResult *result)
+{
+
+    double t_start = omp_get_wtime();
+    const int n_particles = state->n_particles;
+
+    /* Initialize chain at prior mean */
+    PMMHParams current = prior->mean;
+    double current_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &current);
+    double current_lp = pmmh_log_prior(&current, prior);
+
+    /* Proposal standard deviations */
+    double prop_drift_std = 0.0004;
+    double prop_mu_std = 0.08;
+    double prop_sigma_log_std = 0.05;
+
+    /* Sample storage */
+    int max_samples = n_iterations - n_burnin;
+    double *samples_drift = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
+    double *samples_mu = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
+    double *samples_sigma = (double *)ALIGNED_ALLOC(max_samples * sizeof(double));
+
+    int n_accepted = 0;
+    int sample_idx = 0;
+
+    /* Proposal noise buffer */
+    double prop_noise[3];
+    int tid = omp_get_thread_num();
+
+    for (int iter = 0; iter < n_iterations; iter++)
+    {
+        /* Generate proposal noise */
+        vdRngGaussian(VSL_RNG_METHOD_GAUSSIAN_ICDF, state->streams[tid],
+                      3, prop_noise, 0.0, 1.0);
+
+        /* Propose new parameters */
+        PMMHParams proposed;
+        proposed.drift = current.drift + prop_noise[0] * prop_drift_std;
+        proposed.mu_vol = current.mu_vol + prop_noise[1] * prop_mu_std;
+        proposed.sigma_vol = current.sigma_vol * exp(prop_noise[2] * prop_sigma_log_std);
+
+        /* Clamp to bounds */
+        if (proposed.drift < -0.01)
+            proposed.drift = -0.01;
+        if (proposed.drift > 0.01)
+            proposed.drift = 0.01;
+        if (proposed.mu_vol < -8.0)
+            proposed.mu_vol = -8.0;
+        if (proposed.mu_vol > 0.0)
+            proposed.mu_vol = 0.0;
+        if (proposed.sigma_vol < 0.01)
+            proposed.sigma_vol = 0.01;
+        if (proposed.sigma_vol > 0.5)
+            proposed.sigma_vol = 0.5;
+
+        /* Compute acceptance ratio */
+        double prop_ll = pmmh_log_likelihood_mkl(state, returns, n_obs, &proposed);
+        double prop_lp = pmmh_log_prior(&proposed, prior);
+
+        double log_alpha = (prop_ll + prop_lp) - (current_ll + current_lp);
+
+        /* MH accept/reject */
+        double u;
+        vdRngUniform(VSL_RNG_METHOD_UNIFORM_STD, state->streams[tid], 1, &u, 0.0, 1.0);
+
+        if (log(u) < log_alpha)
+        {
+            current = proposed;
+            current_ll = prop_ll;
+            current_lp = prop_lp;
+            n_accepted++;
+        }
+
+        /* Store sample after burnin */
+        if (iter >= n_burnin)
+        {
+            samples_drift[sample_idx] = current.drift;
+            samples_mu[sample_idx] = current.mu_vol;
+            samples_sigma[sample_idx] = current.sigma_vol;
+            sample_idx++;
+        }
+    }
+
+    /* Compute posterior statistics using SIMD reductions */
+    result->n_samples = sample_idx;
+
+    double sum_drift = 0, sum_mu = 0, sum_sigma = 0;
+    double sum_sq_drift = 0, sum_sq_mu = 0, sum_sq_sigma = 0;
+
+#pragma omp simd reduction(+ : sum_drift, sum_mu, sum_sigma, sum_sq_drift, sum_sq_mu, sum_sq_sigma)
+    for (int i = 0; i < sample_idx; i++)
+    {
+        double d = samples_drift[i];
+        double m = samples_mu[i];
+        double s = samples_sigma[i];
+        sum_drift += d;
+        sum_mu += m;
+        sum_sigma += s;
+        sum_sq_drift += d * d;
+        sum_sq_mu += m * m;
+        sum_sq_sigma += s * s;
+    }
+
+    double inv_n = 1.0 / sample_idx;
+    result->posterior_mean.drift = sum_drift * inv_n;
+    result->posterior_mean.mu_vol = sum_mu * inv_n;
+    result->posterior_mean.sigma_vol = sum_sigma * inv_n;
+
+    result->posterior_std.drift = sqrt(sum_sq_drift * inv_n -
+                                       result->posterior_mean.drift * result->posterior_mean.drift);
+    result->posterior_std.mu_vol = sqrt(sum_sq_mu * inv_n -
+                                        result->posterior_mean.mu_vol * result->posterior_mean.mu_vol);
+    result->posterior_std.sigma_vol = sqrt(sum_sq_sigma * inv_n -
+                                           result->posterior_mean.sigma_vol * result->posterior_mean.sigma_vol);
+
+    result->acceptance_rate = (double)n_accepted / n_iterations;
+    result->elapsed_ms = (omp_get_wtime() - t_start) * 1000.0;
+
+    /* Cleanup sample storage only (state is external) */
+    ALIGNED_FREE(samples_drift);
+    ALIGNED_FREE(samples_mu);
+    ALIGNED_FREE(samples_sigma);
+}
+
+/*============================================================================
  * PARALLEL MONTE CARLO - RUN MULTIPLE CHAINS
+ *
+ * Optimization: Pre-allocate states per-thread to avoid vslNewStream overhead
  *============================================================================*/
 
 typedef struct
@@ -486,17 +628,36 @@ static void pmmh_run_parallel(const double *returns, int n_obs,
     result->n_chains = n_chains;
     result->results = (PMMHResult *)malloc(n_chains * sizeof(PMMHResult));
 
-/* Run chains in parallel */
+    /* Pre-allocate one state per thread to avoid vslNewStream overhead */
+    int n_threads = omp_get_max_threads();
+    PMMHState **thread_states = (PMMHState **)malloc(n_threads * sizeof(PMMHState *));
+
+    for (int t = 0; t < n_threads; t++)
+    {
+        thread_states[t] = pmmh_state_create(n_particles, theta_vol);
+    }
+
+/* Run chains in parallel, reusing thread-local states */
 #pragma omp parallel for schedule(dynamic)
     for (int chain = 0; chain < n_chains; chain++)
     {
-        /* Each chain gets different seed */
-        unsigned int seed = 12345 + chain * 104729;
+        int tid = omp_get_thread_num();
+        PMMHState *state = thread_states[tid];
 
-        pmmh_run_mkl(returns, n_obs, prior, theta_vol,
-                     n_iterations, n_burnin, n_particles,
-                     seed, &result->results[chain]);
+        /* Seed state for this specific chain */
+        pmmh_state_seed(state, 12345 + chain * 104729);
+
+        /* Run PMMH with pre-allocated state */
+        pmmh_run_mkl_with_state(state, returns, n_obs, prior, theta_vol,
+                                n_iterations, n_burnin, &result->results[chain]);
     }
+
+    /* Cleanup thread states */
+    for (int t = 0; t < n_threads; t++)
+    {
+        pmmh_state_destroy(thread_states[t]);
+    }
+    free(thread_states);
 
     result->total_elapsed_ms = (omp_get_wtime() - t_start) * 1000.0;
 }
