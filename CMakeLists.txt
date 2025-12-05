@@ -129,6 +129,7 @@ endif()
 if(BUILD_2D)
     add_library(particle_filter_2d STATIC
         2D/particle_filter_2d.c
+        2D/pf2d_adaptive.c
     )
 
     target_include_directories(particle_filter_2d PUBLIC
@@ -193,7 +194,7 @@ if(BUILD_2D)
             ${CMAKE_CURRENT_SOURCE_DIR}/2D/particle_filter_2d.def
         )
     else()
-        set_target_properties(particle_filter_shared PROPERTIES PREFIX "")
+        set_target_properties(particle_filter_2d_shared PROPERTIES PREFIX "")
     endif()
 endif()
 
@@ -218,7 +219,7 @@ endif()
 # endif()
 
 #───────────────────────────────────────────────────────────────────────────────
-# Tests / Benchmarks
+# Benchmarks
 #───────────────────────────────────────────────────────────────────────────────
 
 if(BUILD_TESTS)
@@ -267,23 +268,48 @@ if(BUILD_TESTS)
     endif()
 endif()
 
-# Test suite for Particle Filter 2D
+#───────────────────────────────────────────────────────────────────────────────
+# Unit Tests
+#───────────────────────────────────────────────────────────────────────────────
 
-add_executable(test_pf2d
-    test/test_particle_filter_2d.c
-)
-
-target_include_directories(test_pf2d PRIVATE 
-    ${CMAKE_SOURCE_DIR}/2D
-)
-
-target_link_libraries(test_pf2d PRIVATE 
-    particle_filter_2d
-)
-
-# Add as CTest
 enable_testing()
-add_test(NAME particle_filter_tests COMMAND test_pf2d)
+
+# PF2D integration tests - requires MKL
+if(BUILD_2D)
+    add_executable(test_pf2d
+        test/test_particle_filter_2d.c
+    )
+
+    target_include_directories(test_pf2d PRIVATE 
+        ${CMAKE_SOURCE_DIR}/2D
+    )
+
+    target_link_libraries(test_pf2d PRIVATE 
+        particle_filter_2d
+    )
+
+    if(UNIX)
+        target_link_libraries(test_pf2d PRIVATE m)
+    endif()
+
+    add_test(NAME particle_filter_tests COMMAND test_pf2d)
+endif()
+
+# Adaptive self-calibration tests - standalone, no MKL dependency
+add_executable(test_pf2d_adaptive
+    test/test_pf2d_adaptive.c
+)
+
+target_compile_options(test_pf2d_adaptive PRIVATE
+    $<$<C_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+)
+
+if(UNIX)
+    target_link_libraries(test_pf2d_adaptive PRIVATE m)
+endif()
+
+add_test(NAME adaptive_calibration_tests COMMAND test_pf2d_adaptive)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Install
@@ -318,16 +344,6 @@ if(BUILD_2D)
         DESTINATION include/particle_filter
     )
 endif()
-
-# Kelly integration install disabled
-# if(BUILD_KELLY)
-#     install(FILES 
-#         kelly_integration/pf_kelly_interface.h
-#         kelly_integration/pf2d_kelly_interface.h
-#         DESTINATION include/particle_filter
-#     )
-# endif()
-
 
 #───────────────────────────────────────────────────────────────────────────────
 # Summary
