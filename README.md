@@ -4,21 +4,21 @@ High-performance particle filter implementation in C with Intel MKL acceleration
 
 ## Performance
 
-**27 μs/tick @ 37,000 ticks/sec** on Intel i9-14900KF (8 P-cores, 16 threads)
+**28 μs/tick @ 36,000 ticks/sec** on Intel i9-14900KF (8 P-cores, 16 threads)
 
-| Metric | Value |
-|--------|-------|
-| Mean latency | 27 μs/tick |
-| P50 latency | 17 μs/tick |
-| Throughput | 37,000 ticks/sec |
-| Headroom | 185× over ES futures peak (200/sec) |
+| Metric | Double | Float |
+|--------|--------|-------|
+| Mean latency | 30 μs/tick | 28 μs/tick |
+| P50 latency | 16 μs/tick | 13 μs/tick |
+| Throughput | 33,000 ticks/sec | 36,000 ticks/sec |
+| Headroom | 165× over ES futures peak | 180× over ES futures peak |
 
 ### Benchmark Comparison
 
 | Implementation | Latency | Throughput | vs pf2d |
 |----------------|---------|------------|---------|
-| **pf2d (C/MKL)** | 27 μs | 37,000/sec | baseline |
-| FilterPy (NumPy) | 744 μs | 1,343/sec | **27.6× slower** |
+| **pf2d (C/MKL)** | 28 μs | 36,000/sec | baseline |
+| FilterPy (NumPy) | 744 μs | 1,343/sec | **27× slower** |
 | particles (academic) | ~1-2 ms | ~500-1000/sec | **~40-70× slower** |
 
 ### Optimization History
@@ -29,9 +29,10 @@ High-performance particle filter implementation in C with Intel MKL acceleration
 | MKL vectorized path | 37.8 μs | 23.1 μs | 26,468/sec | +95% |
 | Fused parallel regions | 35.7 μs | 20.7 μs | 27,995/sec | +6% |
 | ICDF RNG method | 33.4 μs | 19.1 μs | 29,988/sec | +7% |
-| P-core affinity (Python) | 27.0 μs | 16.7 μs | 37,000/sec | +24% |
-
-**Total improvement: 2.7×** from baseline to final optimized version.
+| P-core affinity | 32.2 μs | 17.1 μs | 31,057/sec | +4% |
+| Block processing (L2 tiling) | 31.0 μs | 16.0 μs | 32,922/sec | +6% |
+| Single-pass variance | 30.0 μs | 15.6 μs | 33,214/sec | +1% |
+| **Float precision** | **28.0 μs** | **12.6 μs** | **36,198/sec** | **+9%** |
 
 ## Features
 
