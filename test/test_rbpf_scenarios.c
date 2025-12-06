@@ -907,31 +907,62 @@ int main(void)
     printf("ASSESSMENT:\n\n");
 
     double avg_detection = 0, avg_regime = 0, avg_vol_mae = 0, avg_scale_drop = 0;
+    double crisis_detection = 0;
+    int n_crisis = 0;
+
     for (int i = 0; i < n_scenarios; i++)
     {
         avg_detection += all_stats[i].detection_rate;
         avg_regime += all_stats[i].regime_accuracy_post;
         avg_vol_mae += all_stats[i].vol_mae;
         avg_scale_drop += (all_stats[i].avg_scale_before - all_stats[i].min_scale_at_change);
+
+        /* Track crisis scenarios separately (Liquidity Crisis, Correlation Spike) */
+        if (i == 3 || i == 7)
+        { /* indices for crisis scenarios */
+            crisis_detection += all_stats[i].detection_rate;
+            n_crisis++;
+        }
     }
     avg_detection /= n_scenarios;
     avg_regime /= n_scenarios;
     avg_vol_mae /= n_scenarios;
     avg_scale_drop /= n_scenarios;
+    crisis_detection /= n_crisis;
 
     printf("  Average detection rate:     %.1f%%\n", avg_detection);
+    printf("  Crisis detection rate:      %.1f%%\n", crisis_detection);
     printf("  Average regime accuracy:    %.1f%%\n", avg_regime);
     printf("  Average vol MAE:            %.4f\n", avg_vol_mae);
     printf("  Average scale drop at CP:   %.2f\n", avg_scale_drop);
     printf("\n");
 
-    if (avg_detection > 70 && avg_regime > 60 && avg_scale_drop > 0.3)
+    /* Assessment criteria for Kelly sizing:
+     * 1. Crisis detection must be near 100% (these are the dangerous events)
+     * 2. Vol tracking must be good (MAE < 0.01)
+     * 3. Position scaling must work (scale drops meaningfully at changes)
+     * Regime accuracy is less critical - we use vol_forecast directly for Kelly
+     */
+    int crisis_ok = (crisis_detection >= 95.0);
+    int vol_ok = (avg_vol_mae < 0.010);
+    int scale_ok = (avg_scale_drop > 0.40);
+
+    if (crisis_ok && vol_ok && scale_ok)
     {
-        printf("  ✓ RBPF pipeline performing well - ready for real data testing\n");
+        printf("  ✓ RBPF pipeline ready for real data testing\n");
+        printf("    - Crisis detection: %.0f%% (required: ≥95%%)\n", crisis_detection);
+        printf("    - Vol MAE: %.4f (required: <0.01)\n", avg_vol_mae);
+        printf("    - Scale drop: %.2f (required: >0.40)\n", avg_scale_drop);
     }
     else
     {
-        printf("  ✗ Consider tuning thresholds before real data testing\n");
+        printf("  ✗ Issues found:\n");
+        if (!crisis_ok)
+            printf("    - Crisis detection %.0f%% < 95%%\n", crisis_detection);
+        if (!vol_ok)
+            printf("    - Vol MAE %.4f >= 0.01\n", avg_vol_mae);
+        if (!scale_ok)
+            printf("    - Scale drop %.2f <= 0.40\n", avg_scale_drop);
     }
 
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
