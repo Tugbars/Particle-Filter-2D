@@ -91,9 +91,12 @@ RBPF_PipelineConfig rbpf_pipeline_default_config(void)
     /* NEW: Confirmation window (reduces false positives)
      * Require N consecutive ticks above threshold before triggering.
      * Single spike = noise, sustained spike = real regime change.
+     *
+     * EXCEPTION: Extreme events (>8σ) bypass confirmation entirely.
      */
-    cfg.confirm_minor = 3; /* 3 consecutive ticks for minor alert */
-    cfg.confirm_major = 2; /* 2 consecutive ticks for major alert (faster reaction) */
+    cfg.confirm_minor = 3;      /* 3 consecutive ticks for minor alert */
+    cfg.confirm_major = 2;      /* 2 consecutive ticks for major alert */
+    cfg.surprise_extreme = 8.0; /* Extreme threshold - bypasses confirmation */
 
     /* Position scaling */
     cfg.scale_on_minor = RBPF_REAL(0.5);
@@ -280,6 +283,7 @@ void rbpf_pipeline_step(RBPF_Pipeline *pipe, rbpf_real_t ssa_return, RBPF_Signal
     /* Track raw signal state (before confirmation) */
     int raw_surprise_major = (out.surprise >= cfg->surprise_major);
     int raw_surprise_minor = (out.surprise >= cfg->surprise_minor);
+    int raw_surprise_extreme = (out.surprise >= cfg->surprise_extreme); /* NEW: extreme bypass */
     int raw_vol_major = (out.vol_ratio >= cfg->vol_ratio_major);
     int raw_vol_minor = (out.vol_ratio >= cfg->vol_ratio_minor);
 
@@ -302,9 +306,11 @@ void rbpf_pipeline_step(RBPF_Pipeline *pipe, rbpf_real_t ssa_return, RBPF_Signal
         pipe->consecutive_vol_spike = 0;
     }
 
-    /* Apply confirmation window - only trigger after N consecutive ticks */
-    int confirmed_surprise_major = raw_surprise_major &&
-                                   (pipe->consecutive_surprise >= cfg->confirm_major);
+    /* Apply confirmation window - only trigger after N consecutive ticks
+     * EXCEPTION: Extreme events (>8σ) bypass confirmation for safety */
+    int confirmed_surprise_major = raw_surprise_extreme || /* Extreme bypasses */
+                                   (raw_surprise_major &&
+                                    (pipe->consecutive_surprise >= cfg->confirm_major));
     int confirmed_surprise_minor = raw_surprise_minor &&
                                    (pipe->consecutive_surprise >= cfg->confirm_minor);
     int confirmed_vol_major = raw_vol_major &&
@@ -463,6 +469,7 @@ void rbpf_pipeline_step_apf(RBPF_Pipeline *pipe,
     /* Change detection with confirmation (same logic as standard step) */
     int raw_surprise_major = (out.surprise >= cfg->surprise_major);
     int raw_surprise_minor = (out.surprise >= cfg->surprise_minor);
+    int raw_surprise_extreme = (out.surprise >= cfg->surprise_extreme); /* Extreme bypass */
     int raw_vol_major = (out.vol_ratio >= cfg->vol_ratio_major);
     int raw_vol_minor = (out.vol_ratio >= cfg->vol_ratio_minor);
 
@@ -484,8 +491,10 @@ void rbpf_pipeline_step_apf(RBPF_Pipeline *pipe,
         pipe->consecutive_vol_spike = 0;
     }
 
-    int confirmed_surprise_major = raw_surprise_major &&
-                                   (pipe->consecutive_surprise >= cfg->confirm_major);
+    /* Extreme events bypass confirmation for safety */
+    int confirmed_surprise_major = raw_surprise_extreme ||
+                                   (raw_surprise_major &&
+                                    (pipe->consecutive_surprise >= cfg->confirm_major));
     int confirmed_surprise_minor = raw_surprise_minor &&
                                    (pipe->consecutive_surprise >= cfg->confirm_minor);
     int confirmed_vol_major = raw_vol_major &&

@@ -144,9 +144,10 @@ static SVParams sv_crisis(void)
 {
     /* Crisis scenario: high vol with jumps
      *
-     * NOTE: Using student_df=0 (Gaussian) to match filter's Omori model.
-     * Student-t caused model mismatch → filter overestimated vol (safe but high MAE).
-     * Jump process still provides realistic crisis dynamics.
+     * NOTE: Using student_df=5 for realistic fat tails.
+     * The Omori mixture (10-component) is specifically designed to handle
+     * fat-tailed returns - it needs them to trigger high-likelihood tail
+     * components properly. Gaussian returns underutilize the model.
      */
     return (SVParams){
         .drift = -0.001,
@@ -157,7 +158,7 @@ static SVParams sv_crisis(void)
         .jump_intensity = 0.02,
         .jump_mean = 0.3,
         .jump_std = 0.2,
-        .student_df = 0 /* Gaussian - matches filter's Omori model */
+        .student_df = 5 /* Fat tails - Omori mixture handles these */
     };
 }
 

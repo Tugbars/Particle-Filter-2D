@@ -732,6 +732,7 @@ typedef float rbpf_real_t;
         rbpf_real_t transition[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
 
         rbpf_real_t surprise_minor, surprise_major;
+        rbpf_real_t surprise_extreme; /* Extreme threshold - bypasses confirmation */
         rbpf_real_t vol_ratio_minor, vol_ratio_major;
         rbpf_real_t scale_on_minor, scale_on_major;
         rbpf_real_t scale_low_confidence, confidence_threshold;
