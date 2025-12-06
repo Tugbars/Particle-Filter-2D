@@ -42,6 +42,10 @@ struct RBPF_Pipeline
     rbpf_real_t baseline_vol; /* Reference volatility */
     int last_regime;          /* For regime change detection */
     int ticks_in_regime;      /* Stability counter */
+
+    /* Confirmation window counters (NEW - reduces false positives) */
+    int consecutive_surprise;  /* Consecutive ticks above surprise threshold */
+    int consecutive_vol_spike; /* Consecutive ticks above vol_ratio threshold */
 };
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -56,7 +60,7 @@ RBPF_PipelineConfig rbpf_pipeline_default_config(void)
     cfg.n_particles = 200;
     cfg.n_regimes = 4;
 
-    /* Regime parameters (typical equity intraday) */
+    /* Regime parameters (typical equity intraday) - STABLE VALUES */
     cfg.theta[0] = RBPF_REAL(0.05);
     cfg.mu_vol[0] = RBPF_REAL(-4.6);
     cfg.sigma_vol[0] = RBPF_REAL(0.05);
@@ -67,7 +71,7 @@ RBPF_PipelineConfig rbpf_pipeline_default_config(void)
     cfg.mu_vol[2] = RBPF_REAL(-2.5);
     cfg.sigma_vol[2] = RBPF_REAL(0.20);
     cfg.theta[3] = RBPF_REAL(0.15);
-    cfg.mu_vol[3] = RBPF_REAL(-1.6);
+    cfg.mu_vol[3] = RBPF_REAL(-1.6); /* STABLE: -1.6 (~20% vol) */
     cfg.sigma_vol[3] = RBPF_REAL(0.30);
 
     /* Transition matrix (moderately sticky) */
@@ -83,6 +87,13 @@ RBPF_PipelineConfig rbpf_pipeline_default_config(void)
     cfg.surprise_major = RBPF_REAL(5.5);
     cfg.vol_ratio_minor = RBPF_REAL(1.75);
     cfg.vol_ratio_major = RBPF_REAL(2.25);
+
+    /* NEW: Confirmation window (reduces false positives)
+     * Require N consecutive ticks above threshold before triggering.
+     * Single spike = noise, sustained spike = real regime change.
+     */
+    cfg.confirm_minor = 3; /* 3 consecutive ticks for minor alert */
+    cfg.confirm_major = 2; /* 2 consecutive ticks for major alert (faster reaction) */
 
     /* Position scaling */
     cfg.scale_on_minor = RBPF_REAL(0.5);
@@ -161,6 +172,10 @@ RBPF_Pipeline *rbpf_pipeline_create(const RBPF_PipelineConfig *config)
     pipe->initialized = 0;
     pipe->tick_count = 0;
 
+    /* Initialize confirmation counters */
+    pipe->consecutive_surprise = 0;
+    pipe->consecutive_vol_spike = 0;
+
     return pipe;
 }
 
@@ -188,6 +203,10 @@ void rbpf_pipeline_init(RBPF_Pipeline *pipe, rbpf_real_t initial_vol)
     pipe->ticks_in_regime = 0;
     pipe->tick_count = 0;
     pipe->initialized = 1;
+
+    /* Reset confirmation counters */
+    pipe->consecutive_surprise = 0;
+    pipe->consecutive_vol_spike = 0;
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +266,10 @@ void rbpf_pipeline_step(RBPF_Pipeline *pipe, rbpf_real_t ssa_return, RBPF_Signal
     }
 
     /*========================================================================
-     * CHANGE DETECTION
+     * CHANGE DETECTION (with confirmation window)
+     *
+     * NEW: Require N consecutive ticks above threshold to trigger.
+     * This eliminates single-tick false positives from noise.
      *======================================================================*/
     sig->surprise = out.surprise;
     sig->vol_ratio = out.vol_ratio;
@@ -255,19 +277,54 @@ void rbpf_pipeline_step(RBPF_Pipeline *pipe, rbpf_real_t ssa_return, RBPF_Signal
     sig->ess = out.ess;
     sig->tick = pipe->tick_count;
 
-    /* Classify change */
+    /* Track raw signal state (before confirmation) */
+    int raw_surprise_major = (out.surprise >= cfg->surprise_major);
+    int raw_surprise_minor = (out.surprise >= cfg->surprise_minor);
+    int raw_vol_major = (out.vol_ratio >= cfg->vol_ratio_major);
+    int raw_vol_minor = (out.vol_ratio >= cfg->vol_ratio_minor);
+
+    /* Update consecutive counters */
+    if (raw_surprise_major || raw_surprise_minor)
+    {
+        pipe->consecutive_surprise++;
+    }
+    else
+    {
+        pipe->consecutive_surprise = 0;
+    }
+
+    if (raw_vol_major || raw_vol_minor)
+    {
+        pipe->consecutive_vol_spike++;
+    }
+    else
+    {
+        pipe->consecutive_vol_spike = 0;
+    }
+
+    /* Apply confirmation window - only trigger after N consecutive ticks */
+    int confirmed_surprise_major = raw_surprise_major &&
+                                   (pipe->consecutive_surprise >= cfg->confirm_major);
+    int confirmed_surprise_minor = raw_surprise_minor &&
+                                   (pipe->consecutive_surprise >= cfg->confirm_minor);
+    int confirmed_vol_major = raw_vol_major &&
+                              (pipe->consecutive_vol_spike >= cfg->confirm_major);
+    int confirmed_vol_minor = raw_vol_minor &&
+                              (pipe->consecutive_vol_spike >= cfg->confirm_minor);
+
+    /* Classify change (using CONFIRMED signals) */
     int vol_spike = 0;
     int regime_shift = 0;
 
-    if (out.surprise >= cfg->surprise_major || out.vol_ratio >= cfg->vol_ratio_major)
+    if (confirmed_surprise_major || confirmed_vol_major)
     {
-        sig->change_detected = 2; /* Major */
-        vol_spike = (out.vol_ratio >= cfg->vol_ratio_major);
+        sig->change_detected = 2; /* Major - confirmed */
+        vol_spike = confirmed_vol_major;
     }
-    else if (out.surprise >= cfg->surprise_minor || out.vol_ratio >= cfg->vol_ratio_minor)
+    else if (confirmed_surprise_minor || confirmed_vol_minor)
     {
-        sig->change_detected = 1; /* Minor */
-        vol_spike = (out.vol_ratio >= cfg->vol_ratio_minor);
+        sig->change_detected = 1; /* Minor - confirmed */
+        vol_spike = confirmed_vol_minor;
     }
     else
     {
@@ -403,19 +460,51 @@ void rbpf_pipeline_step_apf(RBPF_Pipeline *pipe,
     sig->ess = out.ess;
     sig->tick = pipe->tick_count;
 
-    /* Change detection (same logic) */
+    /* Change detection with confirmation (same logic as standard step) */
+    int raw_surprise_major = (out.surprise >= cfg->surprise_major);
+    int raw_surprise_minor = (out.surprise >= cfg->surprise_minor);
+    int raw_vol_major = (out.vol_ratio >= cfg->vol_ratio_major);
+    int raw_vol_minor = (out.vol_ratio >= cfg->vol_ratio_minor);
+
+    if (raw_surprise_major || raw_surprise_minor)
+    {
+        pipe->consecutive_surprise++;
+    }
+    else
+    {
+        pipe->consecutive_surprise = 0;
+    }
+
+    if (raw_vol_major || raw_vol_minor)
+    {
+        pipe->consecutive_vol_spike++;
+    }
+    else
+    {
+        pipe->consecutive_vol_spike = 0;
+    }
+
+    int confirmed_surprise_major = raw_surprise_major &&
+                                   (pipe->consecutive_surprise >= cfg->confirm_major);
+    int confirmed_surprise_minor = raw_surprise_minor &&
+                                   (pipe->consecutive_surprise >= cfg->confirm_minor);
+    int confirmed_vol_major = raw_vol_major &&
+                              (pipe->consecutive_vol_spike >= cfg->confirm_major);
+    int confirmed_vol_minor = raw_vol_minor &&
+                              (pipe->consecutive_vol_spike >= cfg->confirm_minor);
+
     int vol_spike = 0;
     int regime_shift = 0;
 
-    if (out.surprise >= cfg->surprise_major || out.vol_ratio >= cfg->vol_ratio_major)
+    if (confirmed_surprise_major || confirmed_vol_major)
     {
         sig->change_detected = 2;
-        vol_spike = (out.vol_ratio >= cfg->vol_ratio_major);
+        vol_spike = confirmed_vol_major;
     }
-    else if (out.surprise >= cfg->surprise_minor || out.vol_ratio >= cfg->vol_ratio_minor)
+    else if (confirmed_surprise_minor || confirmed_vol_minor)
     {
         sig->change_detected = 1;
-        vol_spike = (out.vol_ratio >= cfg->vol_ratio_minor);
+        vol_spike = confirmed_vol_minor;
     }
     else
     {
@@ -563,6 +652,9 @@ void rbpf_pipeline_print_config(const RBPF_Pipeline *pipe)
            cfg->surprise_minor, cfg->surprise_major);
     printf("    Vol ratio: minor=%.2f, major=%.2f\n",
            cfg->vol_ratio_minor, cfg->vol_ratio_major);
+    printf("\n  Confirmation Window:\n");
+    printf("    Minor: %d consecutive ticks\n", cfg->confirm_minor);
+    printf("    Major: %d consecutive ticks\n", cfg->confirm_major);
     printf("\n  Position Scaling:\n");
     printf("    On minor change: %.2f\n", cfg->scale_on_minor);
     printf("    On major change: %.2f\n", cfg->scale_on_major);

@@ -348,6 +348,12 @@ typedef float rbpf_real_t;
         int hold_count;             /* Ticks candidate has been dominant */
         int hold_threshold;         /* Ticks required before switching (default: 5) */
         rbpf_real_t prob_threshold; /* Probability for immediate switch (default: 0.7) */
+
+        /* Confirmation window (reduces false positives) */
+        int consecutive_surprise;  /* Consecutive ticks with high surprise */
+        int consecutive_vol_spike; /* Consecutive ticks with high vol ratio */
+        int confirm_minor;         /* Required consecutive for minor alert (default: 2) */
+        int confirm_major;         /* Required consecutive for major alert (default: 2) */
     } RBPF_Detection;
 
     /**
@@ -616,16 +622,36 @@ typedef float rbpf_real_t;
      * Lookahead-based resampling for improved regime change detection.
      * Requires r_{t+1} to be available (1-tick lookahead).
      *
-     * Best used with SSA-cleaned data where the lookahead is reliable.
+     * ═══════════════════════════════════════════════════════════════════════════
+     * SPLIT-STREAM ARCHITECTURE (CRITICAL)
+     * ═══════════════════════════════════════════════════════════════════════════
      *
-     * All functions take RAW observations (returns), same as rbpf_ksc_step().
+     * For best results, use DIFFERENT data streams for update vs lookahead:
+     *
+     *   obs_current: SSA-CLEANED return → stable state update
+     *   obs_next:    RAW tick return    → see full spike for lookahead
+     *
+     * Why: If you smooth the lookahead (SSA on obs_next), you remove the
+     * "surprise" signal that triggers aggressive APF resampling. SSA-smoothed
+     * lookahead turns a "crisis detector" into a "laggy tracker".
+     *
+     * Example usage:
+     *   rbpf_ksc_step_apf(rbpf, ssa_return[t], raw_return[t+1], &output);
+     *
+     * Key improvements in this implementation:
+     *   1. Variance inflation (2.5x): Widen search beam for 5σ spikes
+     *   2. Shotgun sampling: Evaluate at mean, ±2σ, take best
+     *   3. Mixture proposal (α=0.8): 80% APF + 20% SIR for diversity
      *───────────────────────────────────────────────────────────────────────────*/
 
-    /* Full APF step - always uses lookahead (~18μs) */
+    /* Full APF step - always uses lookahead (~20μs with shotgun sampling)
+     * obs_current: SSA-cleaned return for UPDATE (stable estimate)
+     * obs_next:    RAW return for LOOKAHEAD (see the spike) */
     void rbpf_ksc_step_apf(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
                            RBPF_KSC_Output *output);
 
-    /* Adaptive APF - switches based on surprise level (10-18μs) */
+    /* Adaptive APF - switches based on surprise level (12-20μs)
+     * Uses standard SIR in calm markets, APF during regime changes */
     void rbpf_ksc_step_adaptive(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
                                 RBPF_KSC_Output *output);
 
@@ -710,6 +736,13 @@ typedef float rbpf_real_t;
         rbpf_real_t scale_on_minor, scale_on_major;
         rbpf_real_t scale_low_confidence, confidence_threshold;
 
+        /* Confirmation window (reduces false positives) */
+        int confirm_minor; /* Consecutive ticks for minor alert (default: 2) */
+        int confirm_major; /* Consecutive ticks for major alert (default: 2) */
+
+        /* Outlier protection */
+        rbpf_real_t outlier_clip_sigma; /* Clip observations beyond N sigma (default: 8.0) */
+
         int smooth_lag, regime_hold_ticks;
         int enable_learning;
         rbpf_real_t learning_shrinkage;
@@ -745,6 +778,7 @@ typedef float rbpf_real_t;
     void rbpf_pipeline_set_scaling(RBPF_Pipeline *pipe,
                                    rbpf_real_t scale_minor, rbpf_real_t scale_major,
                                    rbpf_real_t scale_low_conf, rbpf_real_t conf_threshold);
+    void rbpf_pipeline_set_confirmation(RBPF_Pipeline *pipe, int confirm_minor, int confirm_major);
 
     /* Debug */
     void rbpf_pipeline_print_config(const RBPF_Pipeline *pipe);

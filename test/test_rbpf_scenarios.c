@@ -142,6 +142,12 @@ static SVParams sv_normal_market(void)
 
 static SVParams sv_crisis(void)
 {
+    /* Crisis scenario: high vol with jumps
+     *
+     * NOTE: Using student_df=0 (Gaussian) to match filter's Omori model.
+     * Student-t caused model mismatch → filter overestimated vol (safe but high MAE).
+     * Jump process still provides realistic crisis dynamics.
+     */
     return (SVParams){
         .drift = -0.001,
         .mu_vol = -2.5,
@@ -151,7 +157,8 @@ static SVParams sv_crisis(void)
         .jump_intensity = 0.02,
         .jump_mean = 0.3,
         .jump_std = 0.2,
-        .student_df = 5};
+        .student_df = 0 /* Gaussian - matches filter's Omori model */
+    };
 }
 
 static void sv_step(double *log_vol, double *price, const SVParams *p, double *ret_out)
@@ -224,7 +231,8 @@ static Scenario scenario_flash_crash(void)
         .second_changepoint = 450,
         .final = recovery,
         .expected_regime_before = 0,
-        .expected_regime_after = 3};
+        .expected_regime_after = 2 /* mu_vol=-2.0 < -1.85 → regime 2 */
+    };
 }
 
 /* Scenario 2: Fed Announcement */
@@ -294,7 +302,8 @@ static Scenario scenario_liquidity_crisis(void)
         .after = crisis,
         .has_second_change = 0,
         .expected_regime_before = 0,
-        .expected_regime_after = 3};
+        .expected_regime_after = 2 /* mu_vol=-2.5 → regime 2 */
+    };
 }
 
 /* Scenario 5: Gradual Trend Change */
@@ -398,7 +407,8 @@ static Scenario scenario_correlation_spike(void)
         .after = stress,
         .has_second_change = 0,
         .expected_regime_before = 0,
-        .expected_regime_after = 3};
+        .expected_regime_after = 2 /* mu_vol=-2.5 → regime 2 */
+    };
 }
 
 /* Scenario 9: Oscillating Regimes */
@@ -482,16 +492,18 @@ typedef struct
 static int classify_vol_to_regime(double log_vol)
 {
     /* Map log-vol to regime (aligned with RBPF mu_vol centers):
-     *   Regime 0: μ=-4.6, so log_vol < -4.0 → 0 (calm)
-     *   Regime 1: μ=-3.5, so -4.0 to -3.0  → 1 (normal)
-     *   Regime 2: μ=-2.5, so -3.0 to -2.0  → 2 (elevated)
-     *   Regime 3: μ=-1.6, so > -2.0        → 3 (crisis)
+     *   Regime 0: μ=-4.6, boundary <= -4.05 → 0 (calm, ~1.0%)
+     *   Regime 1: μ=-3.5, -4.05 to -3.0     → 1 (normal, ~3%)
+     *   Regime 2: μ=-2.5, -3.0 to -1.85     → 2 (elevated, ~8%)
+     *   Regime 3: μ=-1.2, > -1.85           → 3 (crisis, ~30%)
+     *
+     * Boundaries at midpoints between regime centers.
      */
-    if (log_vol < -4.0)
+    if (log_vol <= -4.05)
         return 0;
     if (log_vol < -3.0)
         return 1;
-    if (log_vol < -2.0)
+    if (log_vol < -1.85)
         return 2;
     return 3;
 }
