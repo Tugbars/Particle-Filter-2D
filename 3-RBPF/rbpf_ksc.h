@@ -114,6 +114,7 @@ extern "C"
 #define rbpf_pow(x, y) pow(x, y)
 #define rbpf_cos(x) cos(x)
 #define rbpf_sin(x) sin(x)
+#define rbpf_fmax(x, y) fmax(x, y)
 
 /* MKL VML */
 #define rbpf_vsExp vdExp
@@ -152,6 +153,7 @@ typedef float rbpf_real_t;
 #define rbpf_pow(x, y) powf(x, y)
 #define rbpf_cos(x) cosf(x)
 #define rbpf_sin(x) sinf(x)
+#define rbpf_fmax(x, y) fmaxf(x, y)
 
 /* MKL VML */
 #define rbpf_vsExp vsExp
