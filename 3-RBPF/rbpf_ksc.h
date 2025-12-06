@@ -61,8 +61,9 @@ extern "C"
 #define RBPF_ALIGN 64
 #define RBPF_MAX_THREADS 32
 
-/* KSC mixture components */
-#define KSC_N_COMPONENTS 7
+/* Omori et al. (2007) 10-component mixture for log(χ²(1)) approximation
+ * Upgrade from KSC (1998) 7-component: better tail accuracy */
+#define KSC_N_COMPONENTS 10
 
 /* Liu-West parameter learning */
 #define RBPF_LW_LEARN_MU_VOL 1 /* Learn μ_vol per regime */

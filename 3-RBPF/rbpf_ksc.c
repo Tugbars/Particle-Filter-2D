@@ -22,23 +22,28 @@
 #include <mkl_vml.h>
 
 /*─────────────────────────────────────────────────────────────────────────────
- * KIM-SHEPHARD-CHIB (1998) MIXTURE PARAMETERS
+ * OMORI, CHIB, SHEPHARD & NAKAJIMA (2007) MIXTURE PARAMETERS
  *
- * Approximation of log(χ²(1)) as mixture of 7 Gaussians:
+ * 10-component Gaussian mixture approximation of log(χ²(1)):
  * p(log(ε²)) ≈ Σ_k π_k × N(m_k, v_k²)
+ *
+ * Upgrade from KSC (1998): better tail accuracy in both directions
  *───────────────────────────────────────────────────────────────────────────*/
 
 static const rbpf_real_t KSC_PROB[KSC_N_COMPONENTS] = {
-    RBPF_REAL(0.00730), RBPF_REAL(0.10556), RBPF_REAL(0.00002), RBPF_REAL(0.04395),
-    RBPF_REAL(0.34001), RBPF_REAL(0.24566), RBPF_REAL(0.25750)};
+    RBPF_REAL(0.00609), RBPF_REAL(0.04775), RBPF_REAL(0.13057), RBPF_REAL(0.20674),
+    RBPF_REAL(0.22715), RBPF_REAL(0.18842), RBPF_REAL(0.12047), RBPF_REAL(0.05591),
+    RBPF_REAL(0.01575), RBPF_REAL(0.00115)};
 
 static const rbpf_real_t KSC_MEAN[KSC_N_COMPONENTS] = {
-    RBPF_REAL(-10.12999), RBPF_REAL(-3.97281), RBPF_REAL(-8.56686), RBPF_REAL(2.77786),
-    RBPF_REAL(0.61942), RBPF_REAL(1.79518), RBPF_REAL(-1.08819)};
+    RBPF_REAL(1.92677), RBPF_REAL(1.34744), RBPF_REAL(0.73504), RBPF_REAL(0.02266),
+    RBPF_REAL(-0.85173), RBPF_REAL(-1.97278), RBPF_REAL(-3.46788), RBPF_REAL(-5.55246),
+    RBPF_REAL(-8.68384), RBPF_REAL(-14.65000)};
 
 static const rbpf_real_t KSC_VAR[KSC_N_COMPONENTS] = {
-    RBPF_REAL(5.79596), RBPF_REAL(2.61369), RBPF_REAL(5.17950), RBPF_REAL(0.16735),
-    RBPF_REAL(0.64009), RBPF_REAL(0.34023), RBPF_REAL(1.26261)};
+    RBPF_REAL(0.11265), RBPF_REAL(0.17788), RBPF_REAL(0.26768), RBPF_REAL(0.40611),
+    RBPF_REAL(0.62699), RBPF_REAL(0.98583), RBPF_REAL(1.57469), RBPF_REAL(2.54498),
+    RBPF_REAL(4.16591), RBPF_REAL(7.33342)};
 
 /* Precomputed: -0.5 * log(2π) = -0.9189385332 */
 static const rbpf_real_t LOG_2PI_HALF = RBPF_REAL(-0.9189385332);
@@ -873,7 +878,7 @@ static void rbpf_ksc_predict(RBPF_KSC *rbpf)
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
- * UPDATE STEP (optimized 7-component mixture Kalman)
+ * UPDATE STEP (optimized 10-component Omori mixture Kalman)
  *
  * Observation: y = log(r²) = 2ℓ + log(ε²)
  * Linear: y - m_k = H*ℓ + (log(ε²) - m_k), H = 2
@@ -884,15 +889,18 @@ static void rbpf_ksc_predict(RBPF_KSC *rbpf)
  *   - Single pass accumulation
  *───────────────────────────────────────────────────────────────────────────*/
 
-/* Precomputed: log(π_k) for each component */
+/* Precomputed: log(π_k) for each Omori (2007) component */
 static const rbpf_real_t KSC_LOG_PROB[KSC_N_COMPONENTS] = {
-    -4.920f,  /* log(0.00730) */
-    -2.248f,  /* log(0.10556) */
-    -10.820f, /* log(0.00002) */
-    -3.125f,  /* log(0.04395) */
-    -1.079f,  /* log(0.34001) */
-    -1.404f,  /* log(0.24566) */
-    -1.356f   /* log(0.25750) */
+    RBPF_REAL(-5.101), /* log(0.00609) */
+    RBPF_REAL(-3.042), /* log(0.04775) */
+    RBPF_REAL(-2.036), /* log(0.13057) */
+    RBPF_REAL(-1.577), /* log(0.20674) */
+    RBPF_REAL(-1.482), /* log(0.22715) */
+    RBPF_REAL(-1.669), /* log(0.18842) */
+    RBPF_REAL(-2.116), /* log(0.12047) */
+    RBPF_REAL(-2.884), /* log(0.05591) */
+    RBPF_REAL(-4.151), /* log(0.01575) */
+    RBPF_REAL(-6.768)  /* log(0.00115) */
 };
 
 static rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
