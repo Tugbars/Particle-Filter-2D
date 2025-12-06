@@ -185,6 +185,15 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->detection.hold_threshold = 5;              /* Require 5 consecutive ticks */
     rbpf->detection.prob_threshold = RBPF_REAL(0.7); /* Or 70% probability */
 
+    /* Fixed-lag smoothing (dual output) - disabled by default */
+    rbpf->smooth_lag = 0;
+    rbpf->smooth_head = 0;
+    rbpf->smooth_count = 0;
+    for (int i = 0; i < RBPF_MAX_SMOOTH_LAG; i++)
+    {
+        rbpf->smooth_history[i].valid = 0;
+    }
+
     /* Liu-West parameter learning (Phase 3) */
     int n_params = n * n_regimes;
     rbpf->particle_mu_vol = aligned_alloc_real(n_params);
@@ -354,6 +363,25 @@ void rbpf_ksc_set_regime_smoothing(RBPF_KSC *rbpf, int hold_threshold, rbpf_real
     if (prob_threshold > RBPF_REAL(0.95))
         prob_threshold = RBPF_REAL(0.95);
     rbpf->detection.prob_threshold = prob_threshold;
+}
+
+void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag)
+{
+    /* Clamp lag to valid range */
+    if (lag < 0)
+        lag = 0;
+    if (lag > RBPF_MAX_SMOOTH_LAG)
+        lag = RBPF_MAX_SMOOTH_LAG;
+
+    rbpf->smooth_lag = lag;
+    rbpf->smooth_head = 0;
+    rbpf->smooth_count = 0;
+
+    /* Clear history buffer */
+    for (int i = 0; i < RBPF_MAX_SMOOTH_LAG; i++)
+    {
+        rbpf->smooth_history[i].valid = 0;
+    }
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -554,6 +582,35 @@ static void rbpf_ksc_liu_west_compute_stats(RBPF_KSC *rbpf)
         if (rbpf->lw_sigma_vol_var[r] < RBPF_REAL(1e-6))
             rbpf->lw_sigma_vol_var[r] = RBPF_REAL(1e-6);
     }
+
+    /* REGIME REPULSION: "Jaws of Life" to prevent data theft
+     *
+     * Problem: When adjacent regimes cluster together (e.g., R2=-3.6, R3=-3.1),
+     * the lower regime "steals" observations meant for the upper regime because
+     * it has more particles. The upper regime starves and can't learn to rise.
+     *
+     * Solution: Force minimum separation. If R3 is too close to R2, push R3 UP.
+     * This puts R3 in position to capture crisis data, breaking the starvation.
+     * Also increase variance to encourage the particle cloud to explore/jump.
+     *
+     * The separation should be ~0.5-1.0 in log-vol space (factor of 1.6-2.7x in vol).
+     */
+    const rbpf_real_t min_separation = RBPF_REAL(0.6); /* ~1.8x in volatility */
+    const rbpf_real_t var_boost = RBPF_REAL(0.05);     /* Encourage exploration */
+
+    for (int r = 0; r < n_regimes - 1; r++)
+    {
+        rbpf_real_t gap = rbpf->lw_mu_vol_mean[r + 1] - rbpf->lw_mu_vol_mean[r];
+
+        if (gap < min_separation)
+        {
+            /* Push the UPPER regime up to create separation */
+            rbpf->lw_mu_vol_mean[r + 1] = rbpf->lw_mu_vol_mean[r] + min_separation;
+
+            /* Boost variance to help particles jump to new location */
+            rbpf->lw_mu_vol_var[r + 1] += var_boost;
+        }
+    }
 }
 
 /**
@@ -678,6 +735,32 @@ static void rbpf_ksc_liu_west_resample(RBPF_KSC *rbpf, const int *indices)
                 }
             }
         }
+
+        /* MINIMUM SEPARATION: Prevent data theft between adjacent regimes
+         *
+         * After sorting, push each regime up to maintain minimum gap.
+         * This ensures regimes are spread across the volatility spectrum
+         * so each can capture its appropriate data range.
+         */
+        const rbpf_real_t min_sep = RBPF_REAL(0.5); /* Min gap in log-vol space */
+        for (int r = 1; r < n_regimes; r++)
+        {
+            int idx_prev = i * n_regimes + (r - 1);
+            int idx_curr = i * n_regimes + r;
+
+            rbpf_real_t gap = rbpf->particle_mu_vol_tmp[idx_curr] - rbpf->particle_mu_vol_tmp[idx_prev];
+            if (gap < min_sep)
+            {
+                /* Push current regime up */
+                rbpf->particle_mu_vol_tmp[idx_curr] = rbpf->particle_mu_vol_tmp[idx_prev] + min_sep;
+
+                /* Clamp to upper bound */
+                if (rbpf->particle_mu_vol_tmp[idx_curr] > lw->max_mu_vol)
+                {
+                    rbpf->particle_mu_vol_tmp[idx_curr] = lw->max_mu_vol;
+                }
+            }
+        }
     }
 
     /* Pointer swap */
@@ -714,14 +797,14 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
 
     /* Initialize per-particle Liu-West parameters from global params
      *
-     * With ORDER CONSTRAINT in place, we don't need massive spread.
+     * With ORDER CONSTRAINT in place, spread is still useful for exploration.
      * The constraint ensures μ_vol[0] < μ_vol[1] < ... < μ_vol[n_regimes-1]
-     * so particles can't swap labels even with jitter.
+     * after sorting, so particles can explore while maintaining regime identity.
      *
-     * Moderate spread allows exploration while maintaining regime identity.
+     * Spread of 0.5 covers ±1.5 range (3σ) in log-vol space.
      */
-    rbpf_real_t param_spread_mu = RBPF_REAL(0.3);     /* Moderate spread on μ_vol */
-    rbpf_real_t param_spread_sigma = RBPF_REAL(0.05); /* Small spread on σ_vol */
+    rbpf_real_t param_spread_mu = RBPF_REAL(0.5);     /* Wide spread on μ_vol */
+    rbpf_real_t param_spread_sigma = RBPF_REAL(0.08); /* Moderate spread on σ_vol */
 
     for (int i = 0; i < n; i++)
     {
@@ -774,6 +857,27 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
                 }
             }
         }
+
+        /* MINIMUM SEPARATION: Ensure regimes start spread across vol spectrum */
+        const rbpf_real_t min_sep_init = RBPF_REAL(0.5);
+        for (int r = 1; r < n_regimes; r++)
+        {
+            int idx_prev = i * n_regimes + (r - 1);
+            int idx_curr = i * n_regimes + r;
+
+            rbpf_real_t gap = rbpf->particle_mu_vol[idx_curr] - rbpf->particle_mu_vol[idx_prev];
+            if (gap < min_sep_init)
+            {
+                rbpf->particle_mu_vol[idx_curr] = rbpf->particle_mu_vol[idx_prev] + min_sep_init;
+
+                /* Clamp to upper bound if configured */
+                if (rbpf->liu_west.enabled &&
+                    rbpf->particle_mu_vol[idx_curr] > rbpf->liu_west.max_mu_vol)
+                {
+                    rbpf->particle_mu_vol[idx_curr] = rbpf->liu_west.max_mu_vol;
+                }
+            }
+        }
     }
 
     /* Reset detection */
@@ -786,6 +890,14 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     rbpf->detection.stable_regime = 0;
     rbpf->detection.candidate_regime = 0;
     rbpf->detection.hold_count = 0;
+
+    /* Reset fixed-lag smoothing buffer */
+    rbpf->smooth_head = 0;
+    rbpf->smooth_count = 0;
+    for (int i = 0; i < RBPF_MAX_SMOOTH_LAG; i++)
+    {
+        rbpf->smooth_history[i].valid = 0;
+    }
 
     /* Reset Liu-West tick counter */
     rbpf->liu_west.tick_count = 0;
@@ -1480,6 +1592,106 @@ static void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     }
 
     det->prev_regime = dom;
+
+    /*========================================================================
+     * FIXED-LAG SMOOTHING (Dual Output)
+     *
+     * Store current fast estimates in circular buffer.
+     * Output K-lagged estimates for regime confirmation.
+     *
+     * This provides:
+     *   - Fast signal (t):   Immediate reaction to volatility spikes
+     *   - Smooth signal (t-K): Stable regime for position sizing
+     *======================================================================*/
+
+    const int lag = rbpf->smooth_lag;
+
+    if (lag > 0)
+    {
+        /* Store current fast estimates at head position */
+        RBPF_SmoothEntry *entry = &rbpf->smooth_history[rbpf->smooth_head];
+        entry->vol_mean = out->vol_mean;
+        entry->log_vol_mean = out->log_vol_mean;
+        entry->log_vol_var = out->log_vol_var;
+        entry->dominant_regime = out->dominant_regime;
+        entry->ess = out->ess;
+        entry->valid = 1;
+
+        for (int r = 0; r < n_regimes; r++)
+        {
+            entry->regime_probs[r] = out->regime_probs[r];
+        }
+
+        /* Advance head (circular buffer) */
+        rbpf->smooth_head = (rbpf->smooth_head + 1) % RBPF_MAX_SMOOTH_LAG;
+        if (rbpf->smooth_count < lag)
+        {
+            rbpf->smooth_count++;
+        }
+
+        /* Output smooth signal if we have enough history */
+        if (rbpf->smooth_count >= lag)
+        {
+            /* Read from K ticks ago (oldest valid entry) */
+            int smooth_idx = (rbpf->smooth_head - lag + RBPF_MAX_SMOOTH_LAG) % RBPF_MAX_SMOOTH_LAG;
+            const RBPF_SmoothEntry *smooth_entry = &rbpf->smooth_history[smooth_idx];
+
+            out->smooth_valid = 1;
+            out->smooth_lag = lag;
+            out->vol_mean_smooth = smooth_entry->vol_mean;
+            out->log_vol_mean_smooth = smooth_entry->log_vol_mean;
+            out->log_vol_var_smooth = smooth_entry->log_vol_var;
+            out->dominant_regime_smooth = smooth_entry->dominant_regime;
+
+            for (int r = 0; r < n_regimes; r++)
+            {
+                out->regime_probs_smooth[r] = smooth_entry->regime_probs[r];
+            }
+
+            /* Regime confidence: max probability in smooth distribution */
+            rbpf_real_t max_smooth_prob = out->regime_probs_smooth[0];
+            for (int r = 1; r < n_regimes; r++)
+            {
+                if (out->regime_probs_smooth[r] > max_smooth_prob)
+                {
+                    max_smooth_prob = out->regime_probs_smooth[r];
+                }
+            }
+            out->regime_confidence = max_smooth_prob;
+        }
+        else
+        {
+            /* Not enough history yet - output fast signal as fallback */
+            out->smooth_valid = 0;
+            out->smooth_lag = lag;
+            out->vol_mean_smooth = out->vol_mean;
+            out->log_vol_mean_smooth = out->log_vol_mean;
+            out->log_vol_var_smooth = out->log_vol_var;
+            out->dominant_regime_smooth = out->dominant_regime;
+            out->regime_confidence = max_prob;
+
+            for (int r = 0; r < n_regimes; r++)
+            {
+                out->regime_probs_smooth[r] = out->regime_probs[r];
+            }
+        }
+    }
+    else
+    {
+        /* Fixed-lag smoothing disabled - smooth = fast */
+        out->smooth_valid = 1; /* Always valid when disabled (no lag) */
+        out->smooth_lag = 0;
+        out->vol_mean_smooth = out->vol_mean;
+        out->log_vol_mean_smooth = out->log_vol_mean;
+        out->log_vol_var_smooth = out->log_vol_var;
+        out->dominant_regime_smooth = out->dominant_regime;
+        out->regime_confidence = max_prob;
+
+        for (int r = 0; r < n_regimes; r++)
+        {
+            out->regime_probs_smooth[r] = out->regime_probs[r];
+        }
+    }
 }
 
 /*─────────────────────────────────────────────────────────────────────────────

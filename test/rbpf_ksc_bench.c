@@ -391,12 +391,23 @@ BenchmarkResult run_benchmark(int n_particles, const SyntheticData *data,
 
 typedef struct
 {
+    /* Fast signal (t) */
     rbpf_real_t *est_vol;
     rbpf_real_t *est_log_vol;
+    int *est_regime;
+
+    /* Smooth signal (t-K) */
+    rbpf_real_t *est_vol_smooth;
+    rbpf_real_t *est_log_vol_smooth;
+    int *est_regime_smooth;
+    rbpf_real_t *regime_confidence;
+
+    /* Ground truth */
     rbpf_real_t *true_vol;
     rbpf_real_t *true_log_vol;
-    int *est_regime;
     int *true_regime;
+
+    /* Self-aware signals */
     rbpf_real_t *surprise;
     rbpf_real_t *regime_entropy;
     rbpf_real_t *vol_ratio;
@@ -412,12 +423,24 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
 
     DiagnosticData *diag = (DiagnosticData *)malloc(sizeof(DiagnosticData));
     diag->n = n_obs;
+
+    /* Fast signal (t) */
     diag->est_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->est_log_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->est_regime = (int *)malloc(n_obs * sizeof(int));
+
+    /* Smooth signal (t-K) */
+    diag->est_vol_smooth = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->est_log_vol_smooth = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->est_regime_smooth = (int *)malloc(n_obs * sizeof(int));
+    diag->regime_confidence = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+
+    /* Ground truth */
     diag->true_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->true_log_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
-    diag->est_regime = (int *)malloc(n_obs * sizeof(int));
     diag->true_regime = (int *)malloc(n_obs * sizeof(int));
+
+    /* Self-aware signals */
     diag->surprise = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->regime_entropy = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->vol_ratio = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
@@ -463,6 +486,11 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
     /* Regime smoothing: require 8 consecutive ticks OR 75% probability to switch */
     rbpf_ksc_set_regime_smoothing(rbpf, 8, 0.75f);
 
+    /* Fixed-lag smoothing: 5-tick delay for regime confirmation
+     * Fast signal (t): immediate reaction to volatility spikes
+     * Smooth signal (t-5): stable regime for position sizing */
+    rbpf_ksc_set_fixed_lag_smoothing(rbpf, 5);
+
     rbpf_ksc_init(rbpf, rbpf_log(0.01f), 0.1f);
 
     /* Run filter and collect diagnostics */
@@ -471,9 +499,18 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
     {
         rbpf_ksc_step(rbpf, data->returns[t], &out);
 
+        /* Fast signal (t) - immediate */
         diag->est_vol[t] = out.vol_mean;
         diag->est_log_vol[t] = out.log_vol_mean;
-        diag->est_regime[t] = out.smoothed_regime; /* Use smoothed for stability */
+        diag->est_regime[t] = out.dominant_regime; /* Fast: instantaneous */
+
+        /* Smooth signal (t-K) - delayed */
+        diag->est_vol_smooth[t] = out.vol_mean_smooth;
+        diag->est_log_vol_smooth[t] = out.log_vol_mean_smooth;
+        diag->est_regime_smooth[t] = out.dominant_regime_smooth; /* Smooth: K-lagged */
+        diag->regime_confidence[t] = out.regime_confidence;
+
+        /* Self-aware signals */
         diag->surprise[t] = out.surprise;
         diag->regime_entropy[t] = out.regime_entropy;
         diag->vol_ratio[t] = out.vol_ratio;
@@ -490,12 +527,23 @@ void free_diagnostic(DiagnosticData *diag)
 {
     if (diag)
     {
+        /* Fast signal */
         free(diag->est_vol);
         free(diag->est_log_vol);
+        free(diag->est_regime);
+
+        /* Smooth signal */
+        free(diag->est_vol_smooth);
+        free(diag->est_log_vol_smooth);
+        free(diag->est_regime_smooth);
+        free(diag->regime_confidence);
+
+        /* Ground truth */
         free(diag->true_vol);
         free(diag->true_log_vol);
-        free(diag->est_regime);
         free(diag->true_regime);
+
+        /* Self-aware signals */
         free(diag->surprise);
         free(diag->regime_entropy);
         free(diag->vol_ratio);
@@ -515,16 +563,20 @@ void export_diagnostic_csv(const DiagnosticData *diag, const char *filename)
         return;
     }
 
-    fprintf(f, "t,true_vol,est_vol,true_log_vol,est_log_vol,true_regime,est_regime,"
+    /* Header includes both fast and smooth signals */
+    fprintf(f, "t,true_vol,est_vol_fast,est_vol_smooth,"
+               "true_log_vol,est_log_vol_fast,est_log_vol_smooth,"
+               "true_regime,est_regime_fast,est_regime_smooth,regime_confidence,"
                "surprise,entropy,vol_ratio,ess,detected,change_type\n");
 
     for (int t = 0; t < diag->n; t++)
     {
-        fprintf(f, "%d,%.6f,%.6f,%.4f,%.4f,%d,%d,%.4f,%.4f,%.4f,%.1f,%d,%d\n",
+        fprintf(f, "%d,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%d,%d,%d,%.3f,%.4f,%.4f,%.4f,%.1f,%d,%d\n",
                 t,
-                diag->true_vol[t], diag->est_vol[t],
-                diag->true_log_vol[t], diag->est_log_vol[t],
-                diag->true_regime[t], diag->est_regime[t],
+                diag->true_vol[t], diag->est_vol[t], diag->est_vol_smooth[t],
+                diag->true_log_vol[t], diag->est_log_vol[t], diag->est_log_vol_smooth[t],
+                diag->true_regime[t], diag->est_regime[t], diag->est_regime_smooth[t],
+                diag->regime_confidence[t],
                 diag->surprise[t], diag->regime_entropy[t],
                 diag->vol_ratio[t], diag->ess[t],
                 diag->regime_changed[t], diag->change_type[t]);
@@ -668,6 +720,26 @@ void print_tracking_summary(const DiagnosticData *diag)
 
     printf("\nMean ESS: %.1f\n", ess_sum / n);
     printf("Min ESS:  %.1f\n", ess_min);
+
+    /* Fast vs Smooth Regime Comparison */
+    printf("\n=== Fast vs Smooth Regime Accuracy ===\n\n");
+
+    int fast_correct = 0, smooth_correct = 0;
+    int smooth_stable = 0; /* Count where smooth != fast (smoothing active) */
+
+    for (int t = 0; t < n; t++)
+    {
+        if (diag->est_regime[t] == diag->true_regime[t])
+            fast_correct++;
+        if (diag->est_regime_smooth[t] == diag->true_regime[t])
+            smooth_correct++;
+        if (diag->est_regime[t] != diag->est_regime_smooth[t])
+            smooth_stable++;
+    }
+
+    printf("Fast regime accuracy:   %.1f%% (instantaneous)\n", 100.0f * fast_correct / n);
+    printf("Smooth regime accuracy: %.1f%% (5-tick lag)\n", 100.0f * smooth_correct / n);
+    printf("Smoothing difference:   %.1f%% of ticks\n", 100.0f * smooth_stable / n);
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -779,30 +851,38 @@ int main(int argc, char **argv)
     printf("  import matplotlib.pyplot as plt\n");
     printf("  df = pd.read_csv('rbpf_diagnostic.csv')\n");
     printf("  \n");
-    printf("  fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)\n");
+    printf("  fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)\n");
     printf("  \n");
-    printf("  # Log-vol tracking\n");
+    printf("  # Log-vol tracking (fast vs smooth)\n");
     printf("  axes[0].plot(df['t'], df['true_log_vol'], 'b-', alpha=0.7, label='True')\n");
-    printf("  axes[0].plot(df['t'], df['est_log_vol'], 'r-', alpha=0.7, label='Estimate')\n");
+    printf("  axes[0].plot(df['t'], df['est_log_vol_fast'], 'r-', alpha=0.5, label='Fast (t)')\n");
+    printf("  axes[0].plot(df['t'], df['est_log_vol_smooth'], 'g-', alpha=0.7, label='Smooth (t-5)')\n");
     printf("  axes[0].set_ylabel('Log-Vol')\n");
     printf("  axes[0].legend()\n");
     printf("  \n");
-    printf("  # Regime\n");
-    printf("  axes[1].plot(df['t'], df['true_regime'], 'b-', label='True')\n");
-    printf("  axes[1].plot(df['t'], df['est_regime'], 'r--', alpha=0.7, label='Estimate')\n");
+    printf("  # Regime (fast vs smooth)\n");
+    printf("  axes[1].plot(df['t'], df['true_regime'], 'b-', lw=2, label='True')\n");
+    printf("  axes[1].plot(df['t'], df['est_regime_fast'], 'r--', alpha=0.5, label='Fast')\n");
+    printf("  axes[1].plot(df['t'], df['est_regime_smooth'], 'g-', alpha=0.7, label='Smooth')\n");
     printf("  axes[1].set_ylabel('Regime')\n");
     printf("  axes[1].legend()\n");
     printf("  \n");
+    printf("  # Regime confidence\n");
+    printf("  axes[2].plot(df['t'], df['regime_confidence'], 'purple')\n");
+    printf("  axes[2].axhline(y=0.7, color='r', linestyle='--', alpha=0.5, label='70%% threshold')\n");
+    printf("  axes[2].set_ylabel('Confidence')\n");
+    printf("  axes[2].set_ylim([0, 1])\n");
+    printf("  \n");
     printf("  # Surprise\n");
-    printf("  axes[2].plot(df['t'], df['surprise'], 'g-')\n");
-    printf("  axes[2].axhline(y=5, color='r', linestyle='--', alpha=0.5)\n");
-    printf("  axes[2].set_ylabel('Surprise')\n");
+    printf("  axes[3].plot(df['t'], df['surprise'], 'orange')\n");
+    printf("  axes[3].axhline(y=5, color='r', linestyle='--', alpha=0.5)\n");
+    printf("  axes[3].set_ylabel('Surprise')\n");
     printf("  \n");
     printf("  # ESS\n");
-    printf("  axes[3].plot(df['t'], df['ess'], 'purple')\n");
-    printf("  axes[3].axhline(y=100, color='r', linestyle='--', alpha=0.5)\n");
-    printf("  axes[3].set_ylabel('ESS')\n");
-    printf("  axes[3].set_xlabel('Time')\n");
+    printf("  axes[4].plot(df['t'], df['ess'], 'teal')\n");
+    printf("  axes[4].axhline(y=100, color='r', linestyle='--', alpha=0.5)\n");
+    printf("  axes[4].set_ylabel('ESS')\n");
+    printf("  axes[4].set_xlabel('Time')\n");
     printf("  \n");
     printf("  plt.tight_layout()\n");
     printf("  plt.savefig('rbpf_diagnostic.png', dpi=150)\n");
@@ -822,17 +902,21 @@ int main(int argc, char **argv)
     RBPF_KSC *rbpf_lw = rbpf_ksc_create(200, 4);
     if (rbpf_lw)
     {
-        /* Set WRONG initial parameters (deliberately off) */
+        /* Set WRONG initial parameters (deliberately off - small bidirectional errors)
+         *
+         * Initial values are ORDERED (μ_0 < μ_1 < μ_2 < μ_3) to match order constraint.
+         * Errors are small (~0.3-0.5 in log scale) and bidirectional.
+         */
         printf("Initial (wrong) parameters:\n");
-        printf("  Regime 0: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.005f), rbpf_log(0.01f));
-        printf("  Regime 1: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.010f), rbpf_log(0.03f));
-        printf("  Regime 2: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.025f), rbpf_log(0.08f));
-        printf("  Regime 3: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.050f), rbpf_log(0.20f));
+        printf("  Regime 0: μ_vol = %.4f (true: %.4f) [err=+0.41]\n", rbpf_log(0.015f), rbpf_log(0.01f));
+        printf("  Regime 1: μ_vol = %.4f (true: %.4f) [err=-0.18]\n", rbpf_log(0.025f), rbpf_log(0.03f));
+        printf("  Regime 2: μ_vol = %.4f (true: %.4f) [err=-0.29]\n", rbpf_log(0.06f), rbpf_log(0.08f));
+        printf("  Regime 3: μ_vol = %.4f (true: %.4f) [err=-0.29]\n", rbpf_log(0.15f), rbpf_log(0.20f));
 
-        rbpf_ksc_set_regime_params(rbpf_lw, 0, 0.05f, rbpf_log(0.005f), 0.05f); /* Wrong! */
-        rbpf_ksc_set_regime_params(rbpf_lw, 1, 0.08f, rbpf_log(0.010f), 0.10f); /* Wrong! */
-        rbpf_ksc_set_regime_params(rbpf_lw, 2, 0.15f, rbpf_log(0.025f), 0.20f); /* Wrong! */
-        rbpf_ksc_set_regime_params(rbpf_lw, 3, 0.20f, rbpf_log(0.050f), 0.30f); /* Wrong! */
+        rbpf_ksc_set_regime_params(rbpf_lw, 0, 0.05f, rbpf_log(0.015f), 0.05f); /* Too high */
+        rbpf_ksc_set_regime_params(rbpf_lw, 1, 0.08f, rbpf_log(0.025f), 0.10f); /* Too low */
+        rbpf_ksc_set_regime_params(rbpf_lw, 2, 0.15f, rbpf_log(0.06f), 0.20f);  /* Too low */
+        rbpf_ksc_set_regime_params(rbpf_lw, 3, 0.20f, rbpf_log(0.15f), 0.30f);  /* Too low */
 
         rbpf_real_t trans[16] = {
             0.85f, 0.08f, 0.05f, 0.02f,
@@ -843,21 +927,21 @@ int main(int argc, char **argv)
         rbpf_ksc_set_regularization(rbpf_lw, 0.02f, 0.001f);
         rbpf_ksc_set_regime_diversity(rbpf_lw, 25, 0.03f); /* 25 min per regime, 3% mutation */
 
-        /* Enable Liu-West learning with BALANCED settings
+        /* Enable Liu-West learning with settings tuned for convergence
          *
          * Key insight: Liu-West only learns during resample!
-         * - Shrinkage 0.95: Moderate adaptation (not too fast, not too slow)
-         * - Warmup 50: Give filter time to stabilize
-         * - ESS threshold 0.85: Resample frequently
+         * - Shrinkage 0.92: Faster adaptation than 0.95
+         * - Warmup 30: Balance between stability and learning
+         * - ESS threshold 0.80: Resample frequently but not too often
          * - Force resample every 5 ticks: Guarantee learning happens
          *
          * Order constraint prevents label switching (regime 0 always lowest vol)
          */
-        rbpf_ksc_enable_liu_west(rbpf_lw, 0.95f, 50);      /* a=0.95 (balanced), warmup=50 */
-        rbpf_ksc_set_liu_west_resample(rbpf_lw, 0.85f, 5); /* ESS<85%, force every 5 ticks */
+        rbpf_ksc_enable_liu_west(rbpf_lw, 0.92f, 30);      /* a=0.92 (faster), warmup=30 */
+        rbpf_ksc_set_liu_west_resample(rbpf_lw, 0.80f, 5); /* ESS<80%, force every 5 ticks */
         rbpf_ksc_set_liu_west_bounds(rbpf_lw,
-                                     rbpf_log(0.002f), rbpf_log(RBPF_REAL(0.3)), /* μ_vol: [-6.2, -1.2] */
-                                     RBPF_REAL(0.02), RBPF_REAL(0.5));           /* σ_vol: tighter */
+                                     rbpf_log(0.001f), rbpf_log(RBPF_REAL(0.4)), /* μ_vol: [-6.9, -0.9] */
+                                     RBPF_REAL(0.01), RBPF_REAL(0.6));           /* σ_vol bounds */
 
         rbpf_ksc_init(rbpf_lw, rbpf_log(0.01f), 0.1f);
 

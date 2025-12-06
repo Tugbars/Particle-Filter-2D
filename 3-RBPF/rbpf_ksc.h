@@ -60,6 +60,7 @@ extern "C"
 #define RBPF_MAX_REGIMES 8
 #define RBPF_ALIGN 64
 #define RBPF_MAX_THREADS 32
+#define RBPF_MAX_SMOOTH_LAG 16 /* Maximum fixed-lag smoothing window */
 
 /* Omori et al. (2007) 10-component mixture for log(χ²(1)) approximation
  * Upgrade from KSC (1998) 7-component: better tail accuracy */
@@ -313,6 +314,23 @@ typedef float rbpf_real_t;
     } RBPF_LiuWest;
 
     /**
+     * Fixed-lag smoothing history entry
+     *
+     * Stores aggregate statistics from K ticks ago for smoothed output.
+     * Uses O(K × n_regimes) memory, not O(K × n_particles).
+     */
+    typedef struct
+    {
+        rbpf_real_t vol_mean;                       /* E[exp(ℓ)] at this tick */
+        rbpf_real_t log_vol_mean;                   /* E[ℓ] at this tick */
+        rbpf_real_t log_vol_var;                    /* Var[ℓ] at this tick */
+        rbpf_real_t regime_probs[RBPF_MAX_REGIMES]; /* p(r) at this tick */
+        int dominant_regime;                        /* argmax p(r) at this tick */
+        rbpf_real_t ess;                            /* ESS at this tick */
+        int valid;                                  /* 1 if entry is filled */
+    } RBPF_SmoothEntry;
+
+    /**
      * Self-aware detection state (no external model needed)
      */
     typedef struct
@@ -429,6 +447,18 @@ typedef float rbpf_real_t;
         rbpf_real_t lw_sigma_vol_var[RBPF_MAX_REGIMES];  /* Weighted variance of σ_vol */
 
         /*========================================================================
+         * FIXED-LAG SMOOTHING (Dual Output)
+         *
+         * Stores history for K-lag smoothed estimates:
+         *   - Fast signal (t):   Immediate filtered estimate for rapid reaction
+         *   - Smooth signal (t-K): Delayed estimate for regime confirmation
+         *======================================================================*/
+        int smooth_lag;                                       /* K = smoothing lag (0 = disabled) */
+        int smooth_head;                                      /* Circular buffer head index */
+        int smooth_count;                                     /* Number of valid entries */
+        RBPF_SmoothEntry smooth_history[RBPF_MAX_SMOOTH_LAG]; /* Circular buffer */
+
+        /*========================================================================
          * PRECOMPUTED
          *======================================================================*/
         rbpf_real_t uniform_weight; /* 1/n */
@@ -441,13 +471,15 @@ typedef float rbpf_real_t;
      */
     typedef struct
     {
-        /* State estimates */
+        /*========================================================================
+         * FAST SIGNAL (t) - for immediate "duck and cover" reactions
+         *======================================================================*/
         rbpf_real_t vol_mean;     /* E[exp(ℓ)] */
         rbpf_real_t log_vol_mean; /* E[ℓ] */
         rbpf_real_t log_vol_var;  /* Var[ℓ] (includes Kalman uncertainty) */
         rbpf_real_t ess;          /* Effective sample size */
 
-        /* Regime */
+        /* Regime (fast) */
         rbpf_real_t regime_probs[RBPF_MAX_REGIMES];
         int dominant_regime; /* Instantaneous dominant regime */
         int smoothed_regime; /* Smoothed regime (with hysteresis) */
@@ -462,6 +494,27 @@ typedef float rbpf_real_t;
         int regime_changed; /* 0 or 1 */
         int change_type;    /* 0=none, 1=structural, 2=vol_shock, 3=surprise */
 
+        /*========================================================================
+         * SMOOTH SIGNAL (t-K) - for "state of the world" adjustments
+         *
+         * Fixed-lag smoothed estimates with K-tick delay.
+         * Use for: position sizing, spread adjustment, regime confirmation.
+         * Valid only when smooth_valid == 1 (after K ticks of warmup).
+         *======================================================================*/
+        int smooth_valid; /* 1 if smooth signals are valid (after K ticks) */
+        int smooth_lag;   /* K = current smoothing lag */
+
+        rbpf_real_t vol_mean_smooth;     /* E[exp(ℓ)] at t-K */
+        rbpf_real_t log_vol_mean_smooth; /* E[ℓ] at t-K */
+        rbpf_real_t log_vol_var_smooth;  /* Var[ℓ] at t-K */
+
+        rbpf_real_t regime_probs_smooth[RBPF_MAX_REGIMES]; /* p(r) at t-K */
+        int dominant_regime_smooth;                        /* argmax p(r) at t-K */
+        rbpf_real_t regime_confidence;                     /* max(regime_probs_smooth) - how sure are we? */
+
+        /*========================================================================
+         * LEARNED PARAMETERS & DIAGNOSTICS
+         *======================================================================*/
         /* Liu-West learned parameters (Phase 3) */
         rbpf_real_t learned_mu_vol[RBPF_MAX_REGIMES];    /* Weighted mean of μ_vol per regime */
         rbpf_real_t learned_sigma_vol[RBPF_MAX_REGIMES]; /* Weighted mean of σ_vol per regime */
@@ -493,6 +546,16 @@ typedef float rbpf_real_t;
      * hold_threshold: ticks new regime must hold before switching (default: 5)
      * prob_threshold: probability for immediate switch (default: 0.7) */
     void rbpf_ksc_set_regime_smoothing(RBPF_KSC *rbpf, int hold_threshold, rbpf_real_t prob_threshold);
+
+    /* Fixed-lag smoothing: dual output for HFT
+     * lag: number of ticks delay for smooth signal (0 to disable, max RBPF_MAX_SMOOTH_LAG)
+     *
+     * After enabling, output contains:
+     *   - Fast signal (t):   vol_mean, dominant_regime, surprise (immediate reaction)
+     *   - Smooth signal (t-K): vol_mean_smooth, dominant_regime_smooth (regime confirmation)
+     *
+     * Typical usage: lag=5 for regime confirmation, lag=0 for pure filtering */
+    void rbpf_ksc_set_fixed_lag_smoothing(RBPF_KSC *rbpf, int lag);
 
     /* Liu-West parameter learning (Phase 3) */
     void rbpf_ksc_enable_liu_west(RBPF_KSC *rbpf, rbpf_real_t shrinkage, int warmup_ticks);
