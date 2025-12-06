@@ -304,18 +304,18 @@ BenchmarkResult run_benchmark(int n_particles, const SyntheticData *data,
      * Rule of thumb: stay_prob ≈ 0.8-0.9 for HFT with regime changes every 100+ ticks
      */
     rbpf_real_t trans[16] = {
-        0.85f, 0.08f, 0.05f, 0.02f, /* From regime 0: easier to escape */
-        0.08f, 0.80f, 0.08f, 0.04f, /* From regime 1 */
-        0.04f, 0.08f, 0.80f, 0.08f, /* From regime 2 */
-        0.02f, 0.05f, 0.08f, 0.85f  /* From regime 3 */
+        0.92f, 0.05f, 0.02f, 0.01f, /* From regime 0: sticky */
+        0.05f, 0.88f, 0.05f, 0.02f, /* From regime 1 */
+        0.02f, 0.05f, 0.88f, 0.05f, /* From regime 2 */
+        0.01f, 0.02f, 0.05f, 0.92f  /* From regime 3: sticky */
     };
     rbpf_ksc_build_transition_lut(rbpf, trans);
 
     /* Regularization */
     rbpf_ksc_set_regularization(rbpf, 0.02f, 0.001f);
 
-    /* Enable regime diversity to prevent particle collapse */
-    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 20, 0.03f); /* 5% min, 3% mutation */
+    /* Reduced regime diversity mutation to prevent flickering */
+    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 25, 0.01f); /* 4% min, 1% mutation */
 
     /* Allocate output storage */
     rbpf_real_t *est_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
@@ -442,15 +442,27 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
     rbpf_ksc_set_regime_params(rbpf, 2, 0.12f, rbpf_log(0.08f), 0.20f); /* -2.5: high */
     rbpf_ksc_set_regime_params(rbpf, 3, 0.15f, rbpf_log(0.20f), 0.30f); /* -1.6: crisis */
 
+    /* Transition matrix: sticky regimes to reduce flickering
+     *
+     * 90% stay probability prevents rapid regime switching.
+     * Off-diagonal entries allow gradual transitions (0→1→2→3).
+     */
     rbpf_real_t trans[16] = {
-        0.85f, 0.08f, 0.05f, 0.02f, /* From regime 0 */
-        0.08f, 0.80f, 0.08f, 0.04f, /* From regime 1 */
-        0.04f, 0.08f, 0.80f, 0.08f, /* From regime 2 */
-        0.02f, 0.05f, 0.08f, 0.85f  /* From regime 3 */
+        0.92f, 0.05f, 0.02f, 0.01f, /* From regime 0: mostly stay */
+        0.05f, 0.88f, 0.05f, 0.02f, /* From regime 1 */
+        0.02f, 0.05f, 0.88f, 0.05f, /* From regime 2 */
+        0.01f, 0.02f, 0.05f, 0.92f  /* From regime 3: mostly stay */
     };
     rbpf_ksc_build_transition_lut(rbpf, trans);
     rbpf_ksc_set_regularization(rbpf, 0.02f, 0.001f);
-    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 20, 0.03f);
+
+    /* Reduce regime diversity mutation to prevent noise
+     * Keep minimum particles but lower mutation rate */
+    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 25, 0.01f); /* 4% min, 1% mutation */
+
+    /* Regime smoothing: require 8 consecutive ticks OR 75% probability to switch */
+    rbpf_ksc_set_regime_smoothing(rbpf, 8, 0.75f);
+
     rbpf_ksc_init(rbpf, rbpf_log(0.01f), 0.1f);
 
     /* Run filter and collect diagnostics */
@@ -461,7 +473,7 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
 
         diag->est_vol[t] = out.vol_mean;
         diag->est_log_vol[t] = out.log_vol_mean;
-        diag->est_regime[t] = out.dominant_regime;
+        diag->est_regime[t] = out.smoothed_regime; /* Use smoothed for stability */
         diag->surprise[t] = out.surprise;
         diag->regime_entropy[t] = out.regime_entropy;
         diag->vol_ratio[t] = out.vol_ratio;
@@ -813,9 +825,9 @@ int main(int argc, char **argv)
         /* Set WRONG initial parameters (deliberately off) */
         printf("Initial (wrong) parameters:\n");
         printf("  Regime 0: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.005f), rbpf_log(0.01f));
-        printf("  Regime 1: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.010f), rbpf_log(0.02f));
-        printf("  Regime 2: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.025f), rbpf_log(0.05f));
-        printf("  Regime 3: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.050f), rbpf_log(0.10f));
+        printf("  Regime 1: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.010f), rbpf_log(0.03f));
+        printf("  Regime 2: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.025f), rbpf_log(0.08f));
+        printf("  Regime 3: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.050f), rbpf_log(0.20f));
 
         rbpf_ksc_set_regime_params(rbpf_lw, 0, 0.05f, rbpf_log(0.005f), 0.05f); /* Wrong! */
         rbpf_ksc_set_regime_params(rbpf_lw, 1, 0.08f, rbpf_log(0.010f), 0.10f); /* Wrong! */
@@ -831,19 +843,21 @@ int main(int argc, char **argv)
         rbpf_ksc_set_regularization(rbpf_lw, 0.02f, 0.001f);
         rbpf_ksc_set_regime_diversity(rbpf_lw, 25, 0.03f); /* 25 min per regime, 3% mutation */
 
-        /* Enable Liu-West learning with AGGRESSIVE settings
+        /* Enable Liu-West learning with BALANCED settings
          *
          * Key insight: Liu-West only learns during resample!
-         * - Shrinkage 0.90: Fast adaptation (was 0.98, way too slow)
-         * - Warmup 20: Start learning quickly
-         * - ESS threshold 0.90: Resample frequently
-         * - Force resample every 3 ticks: Guarantee learning happens
+         * - Shrinkage 0.95: Moderate adaptation (not too fast, not too slow)
+         * - Warmup 50: Give filter time to stabilize
+         * - ESS threshold 0.85: Resample frequently
+         * - Force resample every 5 ticks: Guarantee learning happens
+         *
+         * Order constraint prevents label switching (regime 0 always lowest vol)
          */
-        rbpf_ksc_enable_liu_west(rbpf_lw, 0.90f, 20);      /* a=0.90 (very fast), warmup=20 */
-        rbpf_ksc_set_liu_west_resample(rbpf_lw, 0.90f, 3); /* ESS<90%, force every 3 ticks */
+        rbpf_ksc_enable_liu_west(rbpf_lw, 0.95f, 50);      /* a=0.95 (balanced), warmup=50 */
+        rbpf_ksc_set_liu_west_resample(rbpf_lw, 0.85f, 5); /* ESS<85%, force every 5 ticks */
         rbpf_ksc_set_liu_west_bounds(rbpf_lw,
-                                     rbpf_log(0.001f), rbpf_log(RBPF_REAL(0.5)), /* μ_vol bounds */
-                                     RBPF_REAL(0.01), RBPF_REAL(1.0));           /* σ_vol bounds */
+                                     rbpf_log(0.002f), rbpf_log(RBPF_REAL(0.3)), /* μ_vol: [-6.2, -1.2] */
+                                     RBPF_REAL(0.02), RBPF_REAL(0.5));           /* σ_vol: tighter */
 
         rbpf_ksc_init(rbpf_lw, rbpf_log(0.01f), 0.1f);
 

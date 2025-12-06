@@ -173,6 +173,13 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
 
+    /* Regime smoothing (hysteresis) */
+    rbpf->detection.stable_regime = 0;
+    rbpf->detection.candidate_regime = 0;
+    rbpf->detection.hold_count = 0;
+    rbpf->detection.hold_threshold = 5;              /* Require 5 consecutive ticks */
+    rbpf->detection.prob_threshold = RBPF_REAL(0.7); /* Or 70% probability */
+
     /* Liu-West parameter learning (Phase 3) */
     int n_params = n * n_regimes;
     rbpf->particle_mu_vol = aligned_alloc_real(n_params);
@@ -198,6 +205,15 @@ RBPF_KSC *rbpf_ksc_create(int n_particles, int n_regimes)
     rbpf->liu_west.learn_sigma_vol = 0; /* Off by default */
     rbpf->liu_west.warmup_ticks = 100;
     rbpf->liu_west.tick_count = 0;
+
+    /* Initialize Liu-West cached means from global params */
+    for (int r = 0; r < n_regimes; r++)
+    {
+        rbpf->lw_mu_vol_mean[r] = rbpf->params[r].mu_vol;
+        rbpf->lw_sigma_vol_mean[r] = rbpf->params[r].sigma_vol;
+        rbpf->lw_mu_vol_var[r] = RBPF_REAL(0.1); /* Allow exploration */
+        rbpf->lw_sigma_vol_var[r] = RBPF_REAL(0.01);
+    }
 
     /* MKL fast math mode */
     vmlSetMode(VML_EP | VML_FTZDAZ_ON | VML_ERRMODE_IGNORE);
@@ -268,6 +284,10 @@ void rbpf_ksc_set_regime_params(RBPF_KSC *rbpf, int r,
     rbpf->params[r].mu_vol = mu_vol;
     rbpf->params[r].sigma_vol = sigma_vol;
     rbpf->params[r].q = sigma_vol * sigma_vol;
+
+    /* Also update Liu-West cached means (these are the fallback values) */
+    rbpf->lw_mu_vol_mean[r] = mu_vol;
+    rbpf->lw_sigma_vol_mean[r] = sigma_vol;
 }
 
 void rbpf_ksc_build_transition_lut(RBPF_KSC *rbpf, const rbpf_real_t *trans_matrix)
@@ -314,6 +334,21 @@ void rbpf_ksc_set_regime_diversity(RBPF_KSC *rbpf, int min_per_regime, rbpf_real
     if (mutation_prob > RBPF_REAL(0.2))
         mutation_prob = RBPF_REAL(0.2);
     rbpf->regime_mutation_prob = mutation_prob;
+}
+
+void rbpf_ksc_set_regime_smoothing(RBPF_KSC *rbpf, int hold_threshold, rbpf_real_t prob_threshold)
+{
+    if (hold_threshold < 1)
+        hold_threshold = 1;
+    if (hold_threshold > 50)
+        hold_threshold = 50;
+    rbpf->detection.hold_threshold = hold_threshold;
+
+    if (prob_threshold < RBPF_REAL(0.5))
+        prob_threshold = RBPF_REAL(0.5);
+    if (prob_threshold > RBPF_REAL(0.95))
+        prob_threshold = RBPF_REAL(0.95);
+    rbpf->detection.prob_threshold = prob_threshold;
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
@@ -375,10 +410,15 @@ void rbpf_ksc_get_learned_params(const RBPF_KSC *rbpf, int regime,
         return;
     }
 
-    /* Compute weighted average across particles */
+    /* Compute weighted average across particles CURRENTLY IN this regime
+     *
+     * Only particles in regime r have their μ_vol[r] "tested" against data.
+     * Particles in other regimes just drift toward the mean without learning.
+     */
     int n = rbpf->n_particles;
     int n_regimes = rbpf->n_regimes;
     const rbpf_real_t *log_w = rbpf->log_weight;
+    const int *particle_regime = rbpf->regime;
 
     /* Find max log weight for numerical stability */
     rbpf_real_t max_log_w = log_w[0];
@@ -394,11 +434,24 @@ void rbpf_ksc_get_learned_params(const RBPF_KSC *rbpf, int regime,
 
     for (int i = 0; i < n; i++)
     {
+        /* Only count particles currently in this regime */
+        if (particle_regime[i] != regime)
+            continue;
+
         rbpf_real_t w = rbpf_exp(log_w[i] - max_log_w);
         int idx = i * n_regimes + regime;
         sum_mu += w * rbpf->particle_mu_vol[idx];
         sum_sigma += w * rbpf->particle_sigma_vol[idx];
         sum_w += w;
+    }
+
+    /* If no particles in this regime, use the cached Liu-West mean
+     * (which was computed last time particles were in this regime) */
+    if (sum_w < RBPF_REAL(1e-10))
+    {
+        *mu_vol_out = rbpf->lw_mu_vol_mean[regime];
+        *sigma_vol_out = rbpf->lw_sigma_vol_mean[regime];
+        return;
     }
 
     *mu_vol_out = sum_mu / sum_w;
@@ -413,6 +466,7 @@ static void rbpf_ksc_liu_west_compute_stats(RBPF_KSC *rbpf)
     int n = rbpf->n_particles;
     int n_regimes = rbpf->n_regimes;
     const rbpf_real_t *log_w = rbpf->log_weight;
+    const int *regime = rbpf->regime;
 
     /* Find max log weight for numerical stability */
     rbpf_real_t max_log_w = log_w[0];
@@ -436,14 +490,29 @@ static void rbpf_ksc_liu_west_compute_stats(RBPF_KSC *rbpf)
         w[i] *= inv_sum;
     }
 
-    /* Compute weighted mean and variance for each regime */
+    /* Compute weighted mean and variance for each regime
+     *
+     * CRITICAL FIX: Only count particles CURRENTLY IN regime r!
+     *
+     * A particle in regime 0 has no information about regime 3's parameters.
+     * If we weight all particles equally, high-weight particles from the
+     * dominant regime corrupt the statistics for minority regimes.
+     *
+     * This is the core Liu-West insight: parameters are learned from
+     * particles that are "testing" those parameters against the data.
+     */
     for (int r = 0; r < n_regimes; r++)
     {
         rbpf_real_t sum_mu = RBPF_REAL(0.0), sum_mu2 = RBPF_REAL(0.0);
         rbpf_real_t sum_sigma = RBPF_REAL(0.0), sum_sigma2 = RBPF_REAL(0.0);
+        rbpf_real_t sum_w_r = RBPF_REAL(0.0); /* Total weight of particles in regime r */
 
         for (int i = 0; i < n; i++)
         {
+            /* Only count particles currently in this regime */
+            if (regime[i] != r)
+                continue;
+
             int idx = i * n_regimes + r;
             rbpf_real_t mu_v = rbpf->particle_mu_vol[idx];
             rbpf_real_t sigma_v = rbpf->particle_sigma_vol[idx];
@@ -452,17 +521,33 @@ static void rbpf_ksc_liu_west_compute_stats(RBPF_KSC *rbpf)
             sum_mu2 += w[i] * mu_v * mu_v;
             sum_sigma += w[i] * sigma_v;
             sum_sigma2 += w[i] * sigma_v * sigma_v;
+            sum_w_r += w[i];
         }
 
-        rbpf->lw_mu_vol_mean[r] = sum_mu;
-        rbpf->lw_mu_vol_var[r] = sum_mu2 - sum_mu * sum_mu;
-        if (rbpf->lw_mu_vol_var[r] < RBPF_REAL(1e-10))
-            rbpf->lw_mu_vol_var[r] = RBPF_REAL(1e-10);
+        /* Normalize by regime weight (not total weight) */
+        if (sum_w_r > RBPF_REAL(1e-10))
+        {
+            rbpf_real_t inv_w_r = RBPF_REAL(1.0) / sum_w_r;
+            rbpf->lw_mu_vol_mean[r] = sum_mu * inv_w_r;
+            rbpf->lw_mu_vol_var[r] = sum_mu2 * inv_w_r -
+                                     rbpf->lw_mu_vol_mean[r] * rbpf->lw_mu_vol_mean[r];
+            rbpf->lw_sigma_vol_mean[r] = sum_sigma * inv_w_r;
+            rbpf->lw_sigma_vol_var[r] = sum_sigma2 * inv_w_r -
+                                        rbpf->lw_sigma_vol_mean[r] * rbpf->lw_sigma_vol_mean[r];
+        }
+        else
+        {
+            /* No particles in this regime - keep previous mean, set small variance */
+            /* (variance will allow exploration when particles do enter) */
+            rbpf->lw_mu_vol_var[r] = RBPF_REAL(0.1); /* Allow exploration */
+            rbpf->lw_sigma_vol_var[r] = RBPF_REAL(0.01);
+        }
 
-        rbpf->lw_sigma_vol_mean[r] = sum_sigma;
-        rbpf->lw_sigma_vol_var[r] = sum_sigma2 - sum_sigma * sum_sigma;
-        if (rbpf->lw_sigma_vol_var[r] < RBPF_REAL(1e-10))
-            rbpf->lw_sigma_vol_var[r] = RBPF_REAL(1e-10);
+        /* Floor variances */
+        if (rbpf->lw_mu_vol_var[r] < RBPF_REAL(1e-6))
+            rbpf->lw_mu_vol_var[r] = RBPF_REAL(1e-6);
+        if (rbpf->lw_sigma_vol_var[r] < RBPF_REAL(1e-6))
+            rbpf->lw_sigma_vol_var[r] = RBPF_REAL(1e-6);
     }
 }
 
@@ -489,19 +574,30 @@ static void rbpf_ksc_liu_west_resample(RBPF_KSC *rbpf, const int *indices)
 
     RBPF_LiuWest *lw = &rbpf->liu_west;
     rbpf_pcg32_t *rng = &rbpf->pcg[0];
+    const int *regime = rbpf->regime; /* Current regime of each particle */
 
-    /* Gather parameters from parents into tmp buffers */
+    /* Gather parameters from parents into tmp buffers
+     *
+     * CRITICAL FIX: Only apply Liu-West update to the CURRENT regime's params!
+     *
+     * A particle in regime 0 has no information about regime 3's μ_vol.
+     * If we shrink its regime 3 estimate toward the mean, we're just adding noise.
+     *
+     * For other regimes, just copy from parent without shrinkage.
+     */
     for (int i = 0; i < n; i++)
     {
         int parent = indices[i];
+        int current_regime = regime[i]; /* This particle's current regime */
+
         for (int r = 0; r < n_regimes; r++)
         {
             int idx_new = i * n_regimes + r;
             int idx_parent = parent * n_regimes + r;
 
-            /* Liu-West update for μ_vol */
-            if (lw->learn_mu_vol)
+            if (r == current_regime && lw->learn_mu_vol)
             {
+                /* This particle IS in regime r - apply Liu-West update */
                 rbpf_real_t parent_val = rbpf->particle_mu_vol[idx_parent];
                 rbpf_real_t mean_val = rbpf->lw_mu_vol_mean[r];
                 rbpf_real_t h = h_scale * rbpf_sqrt(rbpf->lw_mu_vol_var[r]);
@@ -519,11 +615,12 @@ static void rbpf_ksc_liu_west_resample(RBPF_KSC *rbpf, const int *indices)
             }
             else
             {
+                /* Not in this regime - just copy from parent (no learning) */
                 rbpf->particle_mu_vol_tmp[idx_new] = rbpf->particle_mu_vol[idx_parent];
             }
 
-            /* Liu-West update for σ_vol (if enabled) */
-            if (lw->learn_sigma_vol)
+            /* Same logic for σ_vol */
+            if (r == current_regime && lw->learn_sigma_vol)
             {
                 rbpf_real_t parent_val = rbpf->particle_sigma_vol[idx_parent];
                 rbpf_real_t mean_val = rbpf->lw_sigma_vol_mean[r];
@@ -532,7 +629,6 @@ static void rbpf_ksc_liu_west_resample(RBPF_KSC *rbpf, const int *indices)
 
                 rbpf_real_t new_val = a * parent_val + one_minus_a * mean_val + h * rbpf_fabs(noise);
 
-                /* Clamp to bounds (σ_vol must be positive) */
                 if (new_val < lw->min_sigma_vol)
                     new_val = lw->min_sigma_vol;
                 if (new_val > lw->max_sigma_vol)
@@ -543,6 +639,38 @@ static void rbpf_ksc_liu_west_resample(RBPF_KSC *rbpf, const int *indices)
             else
             {
                 rbpf->particle_sigma_vol_tmp[idx_new] = rbpf->particle_sigma_vol[idx_parent];
+            }
+        }
+
+        /* ORDER CONSTRAINT: Enforce μ_vol[0] < μ_vol[1] < ... < μ_vol[n_regimes-1]
+         *
+         * This prevents "Label Switching" - a classic mixture model problem where
+         * the low-vol regime accidentally captures high-vol data and vice versa.
+         *
+         * Without this constraint, regime 3 can drift to low values while regime 1
+         * drifts to high values, causing the labels to become meaningless.
+         *
+         * We use bubble sort (O(n²) but n_regimes ≤ 8, so ~28 comparisons max).
+         */
+        for (int r = 0; r < n_regimes - 1; r++)
+        {
+            for (int s = r + 1; s < n_regimes; s++)
+            {
+                int idx_r = i * n_regimes + r;
+                int idx_s = i * n_regimes + s;
+
+                /* If μ_vol[r] > μ_vol[s], swap to maintain ordering */
+                if (rbpf->particle_mu_vol_tmp[idx_r] > rbpf->particle_mu_vol_tmp[idx_s])
+                {
+                    rbpf_real_t temp = rbpf->particle_mu_vol_tmp[idx_r];
+                    rbpf->particle_mu_vol_tmp[idx_r] = rbpf->particle_mu_vol_tmp[idx_s];
+                    rbpf->particle_mu_vol_tmp[idx_s] = temp;
+
+                    /* Also swap σ_vol to keep params paired */
+                    temp = rbpf->particle_sigma_vol_tmp[idx_r];
+                    rbpf->particle_sigma_vol_tmp[idx_r] = rbpf->particle_sigma_vol_tmp[idx_s];
+                    rbpf->particle_sigma_vol_tmp[idx_s] = temp;
+                }
             }
         }
     }
@@ -581,15 +709,14 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
 
     /* Initialize per-particle Liu-West parameters from global params
      *
-     * CRITICAL: If initial params are wrong, particles must spread widely
-     * to "find" the true values. With tight spread (0.05), particles can't
-     * explore and get stuck near the wrong initial guess.
+     * With ORDER CONSTRAINT in place, we don't need massive spread.
+     * The constraint ensures μ_vol[0] < μ_vol[1] < ... < μ_vol[n_regimes-1]
+     * so particles can't swap labels even with jitter.
      *
-     * Spread should cover the expected error in initial params.
-     * Log-scale spread of 1.0 covers ~3x range in volatility.
+     * Moderate spread allows exploration while maintaining regime identity.
      */
-    rbpf_real_t param_spread_mu = RBPF_REAL(0.8);    /* Wide spread on μ_vol */
-    rbpf_real_t param_spread_sigma = RBPF_REAL(0.1); /* Moderate spread on σ_vol */
+    rbpf_real_t param_spread_mu = RBPF_REAL(0.3);     /* Moderate spread on μ_vol */
+    rbpf_real_t param_spread_sigma = RBPF_REAL(0.05); /* Small spread on σ_vol */
 
     for (int i = 0; i < n; i++)
     {
@@ -620,6 +747,28 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
             rbpf->particle_mu_vol[idx] = mu_vol;
             rbpf->particle_sigma_vol[idx] = sigma_vol;
         }
+
+        /* ORDER CONSTRAINT: Enforce μ_vol[0] < μ_vol[1] < ... < μ_vol[n_regimes-1]
+         * Must sort after initialization to prevent label switching from the start */
+        for (int r = 0; r < n_regimes - 1; r++)
+        {
+            for (int s = r + 1; s < n_regimes; s++)
+            {
+                int idx_r = i * n_regimes + r;
+                int idx_s = i * n_regimes + s;
+
+                if (rbpf->particle_mu_vol[idx_r] > rbpf->particle_mu_vol[idx_s])
+                {
+                    rbpf_real_t temp = rbpf->particle_mu_vol[idx_r];
+                    rbpf->particle_mu_vol[idx_r] = rbpf->particle_mu_vol[idx_s];
+                    rbpf->particle_mu_vol[idx_s] = temp;
+
+                    temp = rbpf->particle_sigma_vol[idx_r];
+                    rbpf->particle_sigma_vol[idx_r] = rbpf->particle_sigma_vol[idx_s];
+                    rbpf->particle_sigma_vol[idx_s] = temp;
+                }
+            }
+        }
     }
 
     /* Reset detection */
@@ -627,6 +776,11 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
     rbpf->detection.vol_ema_long = rbpf_exp(mu0);
     rbpf->detection.prev_regime = 0;
     rbpf->detection.cooldown = 0;
+
+    /* Reset regime smoothing */
+    rbpf->detection.stable_regime = 0;
+    rbpf->detection.candidate_regime = 0;
+    rbpf->detection.hold_count = 0;
 
     /* Reset Liu-West tick counter */
     rbpf->liu_west.tick_count = 0;
@@ -1224,6 +1378,51 @@ static void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     }
     out->dominant_regime = dom;
 
+    /* Smoothed regime with hysteresis
+     *
+     * Prevents flickering by requiring either:
+     * 1. New regime dominant for N consecutive ticks, OR
+     * 2. New regime has very high probability (>threshold)
+     *
+     * This makes regime output stable even when instantaneous
+     * particle distribution is noisy.
+     */
+    RBPF_Detection *det = &rbpf->detection;
+
+    if (dom == det->stable_regime)
+    {
+        /* Same as current stable - reset candidate */
+        det->candidate_regime = dom;
+        det->hold_count = 0;
+    }
+    else if (dom == det->candidate_regime)
+    {
+        /* Same as candidate - increment hold count */
+        det->hold_count++;
+
+        /* Switch if held long enough OR probability high enough */
+        if (det->hold_count >= det->hold_threshold || max_prob >= det->prob_threshold)
+        {
+            det->stable_regime = dom;
+            det->hold_count = 0;
+        }
+    }
+    else
+    {
+        /* New candidate - start fresh */
+        det->candidate_regime = dom;
+        det->hold_count = 1;
+
+        /* Immediate switch if probability very high */
+        if (max_prob >= det->prob_threshold)
+        {
+            det->stable_regime = dom;
+            det->hold_count = 0;
+        }
+    }
+
+    out->smoothed_regime = det->stable_regime;
+
     /* Self-aware signals */
     out->marginal_lik = marginal_lik;
     out->surprise = -rbpf_log(marginal_lik + RBPF_REAL(1e-30));
@@ -1241,9 +1440,8 @@ static void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     out->regime_entropy = entropy;
 
     /* Vol ratio (vs EMA) */
-    RBPF_Detection *det = &rbpf->detection;
-    det->vol_ema_short = RBPF_REAL(0.1) * out->vol_mean + 0.9f * det->vol_ema_short;
-    det->vol_ema_long = RBPF_REAL(0.01) * out->vol_mean + 0.99f * det->vol_ema_long;
+    det->vol_ema_short = RBPF_REAL(0.1) * out->vol_mean + RBPF_REAL(0.9) * det->vol_ema_short;
+    det->vol_ema_long = RBPF_REAL(0.01) * out->vol_mean + RBPF_REAL(0.99) * det->vol_ema_long;
     out->vol_ratio = det->vol_ema_short / (det->vol_ema_long + RBPF_REAL(1e-10));
 
     /* Regime change detection */
@@ -1257,7 +1455,7 @@ static void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
     else
     {
         /* Structural: regime flipped with high confidence */
-        int structural = (dom != det->prev_regime) && (max_prob > 0.7f);
+        int structural = (dom != det->prev_regime) && (max_prob > RBPF_REAL(0.7));
 
         /* Vol shock: >80% increase or >50% decrease */
         int vol_shock = (out->vol_ratio > 1.8f) || (out->vol_ratio < RBPF_REAL(0.5));

@@ -320,6 +320,13 @@ typedef float rbpf_real_t;
         rbpf_real_t vol_ema_long;  /* Slow EMA of vol_mean */
         int prev_regime;           /* For structural change detection */
         int cooldown;              /* Ticks since last detection */
+
+        /* Regime smoothing (hysteresis to prevent flickering) */
+        int stable_regime;          /* Smoothed regime output */
+        int candidate_regime;       /* Current candidate for new stable regime */
+        int hold_count;             /* Ticks candidate has been dominant */
+        int hold_threshold;         /* Ticks required before switching (default: 5) */
+        rbpf_real_t prob_threshold; /* Probability for immediate switch (default: 0.7) */
     } RBPF_Detection;
 
     /**
@@ -441,7 +448,8 @@ typedef float rbpf_real_t;
 
         /* Regime */
         rbpf_real_t regime_probs[RBPF_MAX_REGIMES];
-        int dominant_regime;
+        int dominant_regime; /* Instantaneous dominant regime */
+        int smoothed_regime; /* Smoothed regime (with hysteresis) */
 
         /* Self-aware signals (Phase 1) */
         rbpf_real_t marginal_lik;   /* p(y_t | y_{1:t-1}) - EXACT from Kalman */
@@ -479,6 +487,11 @@ typedef float rbpf_real_t;
      * min_per_regime: minimum particles per regime (0 to disable)
      * mutation_prob: probability of random regime mutation [0, 0.1] */
     void rbpf_ksc_set_regime_diversity(RBPF_KSC *rbpf, int min_per_regime, rbpf_real_t mutation_prob);
+
+    /* Regime smoothing: prevent regime flickering with hysteresis
+     * hold_threshold: ticks new regime must hold before switching (default: 5)
+     * prob_threshold: probability for immediate switch (default: 0.7) */
+    void rbpf_ksc_set_regime_smoothing(RBPF_KSC *rbpf, int hold_threshold, rbpf_real_t prob_threshold);
 
     /* Liu-West parameter learning (Phase 3) */
     void rbpf_ksc_enable_liu_west(RBPF_KSC *rbpf, rbpf_real_t shrinkage, int warmup_ticks);

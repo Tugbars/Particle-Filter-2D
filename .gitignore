@@ -28,3 +28,9 @@ python/pf2d_demo2.ipynb
 python/varbreak_pf2d_results.png
 python/bocpd_pf2d_demo.ipynb
 python/pf2d_demo.ipynb
+python/rbpf_diagnostic_changepoints.png
+python/rbpf_diagnostic_errors.png
+python/rbpf_diagnostic_vol.png
+python/rbpf_diagnostic.csv
+python/.ipynb_checkpoints/rbpf_diagnostic-checkpoint.ipynb
+python/rbpf_diagnostic.ipynb
