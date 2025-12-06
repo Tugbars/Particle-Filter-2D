@@ -45,6 +45,8 @@ option(BUILD_1D "Build 1D particle filter" ON)
 option(BUILD_2D "Build 2D particle filter (stochastic vol)" ON)
 option(PF2D_USE_FLOAT "Use single precision for 2D filter" OFF)
 option(PF2D_HIGH_N "Enable HIGH_N mode for 50k+ particles" OFF)
+option(BUILD_RBPF "Build RBPF-KSC (Rao-Blackwellized with Kalman)" ON)
+
 
 #───────────────────────────────────────────────────────────────────────────────
 # Compiler flags
@@ -196,6 +198,14 @@ if(BUILD_2D)
     else()
         set_target_properties(particle_filter_2d_shared PROPERTIES PREFIX "")
     endif()
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
+# 3-RBPF: Rao-Blackwellized Particle Filter (KSC observation model)
+#───────────────────────────────────────────────────────────────────────────────
+
+if(BUILD_RBPF)
+    add_subdirectory(3-RBPF)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -493,6 +503,7 @@ message(STATUS "Build 2D:         ${BUILD_2D}")
 message(STATUS "Build tests:      ${BUILD_TESTS}")
 message(STATUS "Float precision:  ${PF2D_USE_FLOAT}")
 message(STATUS "HIGH_N mode:      ${PF2D_HIGH_N}")
+message(STATUS "Build RBPF:       ${BUILD_RBPF}")
 if(MSVC)
     message(STATUS "Platform:         Windows (MSVC + Intel OpenMP)")
 else()
