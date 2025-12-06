@@ -52,6 +52,8 @@ endif()
 
 add_library(rbpf_ksc_shared SHARED
     rbpf_ksc.c
+    rbpf_apf.c
+    rbpf_pipeline.c
 )
 
 target_include_directories(rbpf_ksc_shared PUBLIC
@@ -116,6 +118,38 @@ if(RBPF_BUILD_BENCH)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
+# Scenario Tests (realistic market scenarios)
+#───────────────────────────────────────────────────────────────────────────────
+
+option(RBPF_BUILD_TESTS "Build RBPF scenario tests" ON)
+
+if(RBPF_BUILD_TESTS)
+    add_executable(test_rbpf_scenarios
+        ${CMAKE_SOURCE_DIR}/test/test_rbpf_scenarios.c
+    )
+
+    target_include_directories(test_rbpf_scenarios PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(test_rbpf_scenarios PRIVATE
+        rbpf_ksc
+    )
+
+    target_compile_options(test_rbpf_scenarios PRIVATE ${COMMON_FLAGS})
+    if(DEFINED COMMON_DEFS)
+        target_compile_definitions(test_rbpf_scenarios PRIVATE ${COMMON_DEFS})
+    endif()
+
+    if(UNIX)
+        target_link_libraries(test_rbpf_scenarios PRIVATE m)
+    endif()
+
+    # Register as CTest
+    add_test(NAME rbpf_scenario_tests COMMAND test_rbpf_scenarios)
+endif()
+
+#───────────────────────────────────────────────────────────────────────────────
 # Install
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -137,4 +171,5 @@ message(STATUS "")
 message(STATUS "=== RBPF-KSC Configuration ===")
 message(STATUS "Precision:        ${RBPF_USE_DOUBLE} (OFF=float, ON=double)")
 message(STATUS "Build benchmark:  ${RBPF_BUILD_BENCH}")
+message(STATUS "Build tests:      ${RBPF_BUILD_TESTS}")
 message(STATUS "")
