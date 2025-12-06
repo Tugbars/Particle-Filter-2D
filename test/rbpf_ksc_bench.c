@@ -3,11 +3,11 @@
  * @brief Benchmark for RBPF-KSC: latency and accuracy vs true volatility
  *
  * Compile:
- *   gcc -O3 -march=native -fopenmp rbpf_ksc.c rbpf_ksc_bench.c -o rbpf_bench \
+ *   gcc -O3 -march=native -fopenmp rbpf_ksc.c rbpf_apf.c rbpf_ksc_bench.c -o rbpf_bench \
  *       -lmkl_rt -lm -DNDEBUG
  *
  * Or with Intel compiler:
- *   icx -O3 -xHost -qopenmp rbpf_ksc.c rbpf_ksc_bench.c -o rbpf_bench \
+ *   icx -O3 -xHost -qopenmp rbpf_ksc.c rbpf_apf.c rbpf_ksc_bench.c -o rbpf_bench \
  *       -qmkl -DNDEBUG
  */
 
@@ -889,6 +889,168 @@ int main(int argc, char **argv)
     printf("  plt.show()\n");
 
     free_diagnostic(diag);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * APF (AUXILIARY PARTICLE FILTER) COMPARISON
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("════════════════════════════════════════════════════════════════════════════\n");
+    printf("                    APF vs SIR COMPARISON (200 particles)\n");
+    printf("════════════════════════════════════════════════════════════════════════════\n\n");
+
+    {
+        int n_p = 200;
+        int n_obs_apf = data->n;
+
+        /* Create filter for APF test */
+        RBPF_KSC *rbpf_apf = rbpf_ksc_create(n_p, 4);
+        if (rbpf_apf)
+        {
+            /* Configure same as main benchmark */
+            rbpf_ksc_set_regime_params(rbpf_apf, 0, 0.05f, rbpf_log(0.01f), 0.05f);
+            rbpf_ksc_set_regime_params(rbpf_apf, 1, 0.08f, rbpf_log(0.03f), 0.10f);
+            rbpf_ksc_set_regime_params(rbpf_apf, 2, 0.12f, rbpf_log(0.08f), 0.20f);
+            rbpf_ksc_set_regime_params(rbpf_apf, 3, 0.15f, rbpf_log(0.20f), 0.30f);
+
+            rbpf_real_t trans_apf[16] = {
+                0.92f, 0.05f, 0.02f, 0.01f,
+                0.05f, 0.88f, 0.05f, 0.02f,
+                0.02f, 0.05f, 0.88f, 0.05f,
+                0.01f, 0.02f, 0.05f, 0.92f};
+            rbpf_ksc_build_transition_lut(rbpf_apf, trans_apf);
+            rbpf_ksc_set_regularization(rbpf_apf, 0.02f, 0.001f);
+            rbpf_ksc_set_regime_diversity(rbpf_apf, n_p / 25, 0.01f);
+            rbpf_ksc_set_fixed_lag_smoothing(rbpf_apf, 5);
+
+            /* Allocate storage */
+            rbpf_real_t *est_vol_sir = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            rbpf_real_t *est_vol_apf = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            rbpf_real_t *est_vol_adaptive = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            rbpf_real_t *est_log_vol_sir = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            rbpf_real_t *est_log_vol_apf = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            rbpf_real_t *est_log_vol_adaptive = (rbpf_real_t *)malloc(n_obs_apf * sizeof(rbpf_real_t));
+            int *est_regime_sir = (int *)malloc(n_obs_apf * sizeof(int));
+            int *est_regime_apf = (int *)malloc(n_obs_apf * sizeof(int));
+            int *est_regime_adaptive = (int *)malloc(n_obs_apf * sizeof(int));
+
+            double total_sir_us = 0, total_apf_us = 0, total_adaptive_us = 0;
+            int apf_trigger_count = 0;
+
+            /* ─── Run 1: Standard SIR ─── */
+            rbpf_ksc_init(rbpf_apf, rbpf_log(0.01f), 0.1f);
+            rbpf_ksc_warmup(rbpf_apf);
+
+            RBPF_KSC_Output out;
+            for (int t = 0; t < n_obs_apf; t++)
+            {
+                double t0 = get_time_us();
+                rbpf_ksc_step(rbpf_apf, data->returns[t], &out);
+                double t1 = get_time_us();
+                total_sir_us += (t1 - t0);
+
+                est_vol_sir[t] = out.vol_mean;
+                est_log_vol_sir[t] = out.log_vol_mean;
+                est_regime_sir[t] = out.dominant_regime;
+            }
+
+            /* ─── Run 2: Always APF ─── */
+            rbpf_ksc_init(rbpf_apf, rbpf_log(0.01f), 0.1f);
+
+            for (int t = 0; t < n_obs_apf - 1; t++)
+            {
+                double t0 = get_time_us();
+                rbpf_ksc_step_apf(rbpf_apf, data->returns[t], data->returns[t + 1], &out);
+                double t1 = get_time_us();
+                total_apf_us += (t1 - t0);
+
+                est_vol_apf[t] = out.vol_mean;
+                est_log_vol_apf[t] = out.log_vol_mean;
+                est_regime_apf[t] = out.dominant_regime;
+            }
+            /* Last tick: no lookahead available */
+            rbpf_ksc_step(rbpf_apf, data->returns[n_obs_apf - 1], &out);
+            est_vol_apf[n_obs_apf - 1] = out.vol_mean;
+            est_log_vol_apf[n_obs_apf - 1] = out.log_vol_mean;
+            est_regime_apf[n_obs_apf - 1] = out.dominant_regime;
+
+            /* ─── Run 3: Adaptive APF ─── */
+            rbpf_ksc_init(rbpf_apf, rbpf_log(0.01f), 0.1f);
+
+            for (int t = 0; t < n_obs_apf - 1; t++)
+            {
+                double t0 = get_time_us();
+                rbpf_ksc_step_adaptive(rbpf_apf, data->returns[t], data->returns[t + 1], &out);
+                double t1 = get_time_us();
+                total_adaptive_us += (t1 - t0);
+
+                if (out.apf_triggered)
+                    apf_trigger_count++;
+
+                est_vol_adaptive[t] = out.vol_mean;
+                est_log_vol_adaptive[t] = out.log_vol_mean;
+                est_regime_adaptive[t] = out.dominant_regime;
+            }
+            /* Last tick */
+            rbpf_ksc_step(rbpf_apf, data->returns[n_obs_apf - 1], &out);
+            est_vol_adaptive[n_obs_apf - 1] = out.vol_mean;
+            est_log_vol_adaptive[n_obs_apf - 1] = out.log_vol_mean;
+            est_regime_adaptive[n_obs_apf - 1] = out.dominant_regime;
+
+            /* Compute accuracy for each */
+            AccuracyMetrics acc_sir = compute_accuracy(est_vol_sir, est_log_vol_sir, est_regime_sir, data);
+            AccuracyMetrics acc_apf = compute_accuracy(est_vol_apf, est_log_vol_apf, est_regime_apf, data);
+            AccuracyMetrics acc_adaptive = compute_accuracy(est_vol_adaptive, est_log_vol_adaptive, est_regime_adaptive, data);
+
+            /* Report */
+            printf("%-12s | %8s | %8s %8s %8s %6s\n",
+                   "Method", "Latency", "MAE_vol", "Tail_MAE", "Corr", "Regime%");
+            printf("─────────────────────────────────────────────────────────────────\n");
+
+            printf("%-12s | %6.2f μs | %8.4f %8.4f %8.4f %5.1f%%\n",
+                   "SIR",
+                   total_sir_us / n_obs_apf,
+                   acc_sir.mae_vol, acc_sir.tail_mae, acc_sir.correlation, acc_sir.regime_accuracy);
+
+            printf("%-12s | %6.2f μs | %8.4f %8.4f %8.4f %5.1f%%\n",
+                   "APF (always)",
+                   total_apf_us / (n_obs_apf - 1),
+                   acc_apf.mae_vol, acc_apf.tail_mae, acc_apf.correlation, acc_apf.regime_accuracy);
+
+            printf("%-12s | %6.2f μs | %8.4f %8.4f %8.4f %5.1f%%\n",
+                   "Adaptive",
+                   total_adaptive_us / (n_obs_apf - 1),
+                   acc_adaptive.mae_vol, acc_adaptive.tail_mae, acc_adaptive.correlation, acc_adaptive.regime_accuracy);
+
+            printf("\nAdaptive APF Statistics:\n");
+            printf("  APF triggered: %d / %d ticks (%.1f%%)\n",
+                   apf_trigger_count, n_obs_apf - 1,
+                   100.0 * apf_trigger_count / (n_obs_apf - 1));
+            printf("  Avg latency when triggered: ~%.1f μs (vs ~%.1f μs SIR)\n",
+                   total_apf_us / (n_obs_apf - 1),
+                   total_sir_us / n_obs_apf);
+
+            /* Improvement summary */
+            rbpf_real_t regime_improvement = acc_apf.regime_accuracy - acc_sir.regime_accuracy;
+            rbpf_real_t tail_improvement = (acc_sir.tail_mae - acc_apf.tail_mae) / acc_sir.tail_mae * 100;
+
+            printf("\nAPF vs SIR Improvement:\n");
+            printf("  Regime accuracy: %+.1f%%\n", regime_improvement);
+            printf("  Tail MAE:        %+.1f%% %s\n", tail_improvement,
+                   tail_improvement > 0 ? "(better)" : "(worse)");
+
+            /* Cleanup */
+            free(est_vol_sir);
+            free(est_vol_apf);
+            free(est_vol_adaptive);
+            free(est_log_vol_sir);
+            free(est_log_vol_apf);
+            free(est_log_vol_adaptive);
+            free(est_regime_sir);
+            free(est_regime_apf);
+            free(est_regime_adaptive);
+            rbpf_ksc_destroy(rbpf_apf);
+        }
+    }
 
     /* ═══════════════════════════════════════════════════════════════════════
      * LIU-WEST PARAMETER LEARNING TEST

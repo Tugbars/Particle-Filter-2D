@@ -919,7 +919,7 @@ void rbpf_ksc_init(RBPF_KSC *rbpf, rbpf_real_t mu0, rbpf_real_t var0)
  *   - Liu-West: uses per-particle parameters when enabled
  *───────────────────────────────────────────────────────────────────────────*/
 
-static void rbpf_ksc_predict(RBPF_KSC *rbpf)
+void rbpf_ksc_predict(RBPF_KSC *rbpf)
 {
     const int n = rbpf->n_particles;
     const RBPF_RegimeParams *params = rbpf->params;
@@ -1015,7 +1015,7 @@ static const rbpf_real_t KSC_LOG_PROB[KSC_N_COMPONENTS] = {
     RBPF_REAL(-6.768)  /* log(0.00115) */
 };
 
-static rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
+rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
 {
     const int n = rbpf->n_particles;
     const rbpf_real_t H = RBPF_REAL(2.0);
@@ -1161,7 +1161,7 @@ static rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y)
  * REGIME TRANSITION (LUT-based, no cumsum search)
  *───────────────────────────────────────────────────────────────────────────*/
 
-static void rbpf_ksc_transition(RBPF_KSC *rbpf)
+void rbpf_ksc_transition(RBPF_KSC *rbpf)
 {
     const int n = rbpf->n_particles;
     int *regime = rbpf->regime;
@@ -1180,7 +1180,7 @@ static void rbpf_ksc_transition(RBPF_KSC *rbpf)
  * RESAMPLE (systematic + regularization)
  *───────────────────────────────────────────────────────────────────────────*/
 
-static int rbpf_ksc_resample(RBPF_KSC *rbpf)
+int rbpf_ksc_resample(RBPF_KSC *rbpf)
 {
     const int n = rbpf->n_particles;
 
@@ -1407,7 +1407,7 @@ static int rbpf_ksc_resample(RBPF_KSC *rbpf)
  * COMPUTE OUTPUTS
  *───────────────────────────────────────────────────────────────────────────*/
 
-static void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
+void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
                                      RBPF_KSC_Output *out)
 {
     const int n = rbpf->n_particles;

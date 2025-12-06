@@ -523,6 +523,7 @@ typedef float rbpf_real_t;
 
         /* Diagnostics */
         int resampled;
+        int apf_triggered; /* 1 if APF lookahead was used this step */
     } RBPF_KSC_Output;
 
     /*─────────────────────────────────────────────────────────────────────────────
@@ -594,6 +595,57 @@ typedef float rbpf_real_t;
 
     /* Debug */
     void rbpf_ksc_print_config(const RBPF_KSC *rbpf);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * Internal functions (exposed for APF extension)
+     *
+     * These are the building blocks of rbpf_ksc_step(). They're exposed so that
+     * rbpf_apf.c can construct alternative step functions (e.g., with lookahead).
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    void rbpf_ksc_predict(RBPF_KSC *rbpf);
+    rbpf_real_t rbpf_ksc_update(RBPF_KSC *rbpf, rbpf_real_t y);
+    void rbpf_ksc_transition(RBPF_KSC *rbpf);
+    int rbpf_ksc_resample(RBPF_KSC *rbpf);
+    void rbpf_ksc_compute_outputs(RBPF_KSC *rbpf, rbpf_real_t marginal_lik,
+                                  RBPF_KSC_Output *out);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * APF (Auxiliary Particle Filter) API
+     *
+     * Lookahead-based resampling for improved regime change detection.
+     * Requires r_{t+1} to be available (1-tick lookahead).
+     *
+     * Best used with SSA-cleaned data where the lookahead is reliable.
+     *
+     * All functions take RAW observations (returns), same as rbpf_ksc_step().
+     *───────────────────────────────────────────────────────────────────────────*/
+
+    /* Full APF step - always uses lookahead (~18μs) */
+    void rbpf_ksc_step_apf(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
+                           RBPF_KSC_Output *output);
+
+    /* Adaptive APF - switches based on surprise level (10-18μs) */
+    void rbpf_ksc_step_adaptive(RBPF_KSC *rbpf, rbpf_real_t obs_current, rbpf_real_t obs_next,
+                                RBPF_KSC_Output *output);
+
+    /* Force APF for next n_steps (call when BOCPD signals changepoint) */
+    void rbpf_ksc_force_apf(int n_steps);
+    int rbpf_ksc_apf_forced(void);
+
+    /* APF statistics */
+    void rbpf_apf_reset_stats(void);
+    void rbpf_apf_get_stats(int *total, int *apf_count, rbpf_real_t *apf_ratio);
+
+    /*─────────────────────────────────────────────────────────────────────────────
+     * INTERNAL FUNCTIONS (exposed for APF module)
+     *───────────────────────────────────────────────────────────────────────────*/
+    void rbpf_ksc_predict_internal(RBPF_KSC *rbpf);
+    rbpf_real_t rbpf_ksc_update_internal(RBPF_KSC *rbpf, rbpf_real_t y);
+    void rbpf_ksc_resample_internal(RBPF_KSC *rbpf);
+    void rbpf_ksc_transition_internal(RBPF_KSC *rbpf);
+    void rbpf_ksc_compute_outputs_internal(RBPF_KSC *rbpf, rbpf_real_t marginal, RBPF_KSC_Output *out);
+    void rbpf_ksc_liu_west_update_internal(RBPF_KSC *rbpf);
 
 #ifdef __cplusplus
 }
