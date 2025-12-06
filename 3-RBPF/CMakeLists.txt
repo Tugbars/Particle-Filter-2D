@@ -92,6 +92,10 @@ if(RBPF_BUILD_BENCH)
         ${CMAKE_SOURCE_DIR}/test/rbpf_ksc_bench.c
     )
 
+    target_include_directories(bench_rbpf_ksc PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
     target_link_libraries(bench_rbpf_ksc PRIVATE
         rbpf_ksc
     )
