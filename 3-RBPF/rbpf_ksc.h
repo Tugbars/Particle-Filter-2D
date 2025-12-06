@@ -647,6 +647,109 @@ typedef float rbpf_real_t;
     void rbpf_ksc_compute_outputs_internal(RBPF_KSC *rbpf, rbpf_real_t marginal, RBPF_KSC_Output *out);
     void rbpf_ksc_liu_west_update_internal(RBPF_KSC *rbpf);
 
+    /*═══════════════════════════════════════════════════════════════════════════
+     * RBPF PIPELINE: Unified Change Detection + Volatility Tracking
+     *
+     * Replaces BOCPD + PF stack with single filter.
+     *
+     * Stack: SSA → RBPF Pipeline → Kelly
+     *
+     * Provides:
+     *   - Volatility forecast (vol_forecast) for Kelly bet sizing
+     *   - Regime identification (regime) for parameter selection
+     *   - Change detection (change_detected) for risk management
+     *   - Position scaling (position_scale) as direct Kelly multiplier
+     *═══════════════════════════════════════════════════════════════════════════*/
+
+    /**
+     * Pipeline signal - everything Kelly needs in one struct
+     */
+    typedef struct
+    {
+        /* Volatility for Kelly */
+        rbpf_real_t vol_forecast;    /* E[σ] for next tick */
+        rbpf_real_t vol_uncertainty; /* Std[σ] for conservative sizing */
+        rbpf_real_t log_vol;         /* E[log(σ)] */
+
+        /* Regime for parameter selection */
+        int regime;                    /* 0=calm, 1=normal, 2=elevated, 3=crisis */
+        rbpf_real_t regime_confidence; /* P(regime correct) */
+        rbpf_real_t regime_probs[RBPF_MAX_REGIMES];
+
+        /* Change detection for risk management */
+        int change_detected;   /* 0=none, 1=minor, 2=major */
+        int change_type;       /* 0=none, 1=vol_spike, 2=regime_shift, 3=both */
+        rbpf_real_t surprise;  /* -log(p(obs)) */
+        rbpf_real_t vol_ratio; /* short_ema / long_ema */
+
+        /* Direct Kelly multiplier */
+        rbpf_real_t position_scale; /* 0.0-1.0, multiply Kelly fraction by this */
+        int action;                 /* 0=normal, 1=reduce, 2=exit */
+
+        /* Diagnostics */
+        rbpf_real_t ess;
+        rbpf_real_t regime_entropy;
+        int tick;
+    } RBPF_Signal;
+
+    /**
+     * Pipeline configuration
+     */
+    typedef struct
+    {
+        int n_particles;
+        int n_regimes;
+
+        rbpf_real_t theta[RBPF_MAX_REGIMES];
+        rbpf_real_t mu_vol[RBPF_MAX_REGIMES];
+        rbpf_real_t sigma_vol[RBPF_MAX_REGIMES];
+        rbpf_real_t transition[RBPF_MAX_REGIMES * RBPF_MAX_REGIMES];
+
+        rbpf_real_t surprise_minor, surprise_major;
+        rbpf_real_t vol_ratio_minor, vol_ratio_major;
+        rbpf_real_t scale_on_minor, scale_on_major;
+        rbpf_real_t scale_low_confidence, confidence_threshold;
+
+        int smooth_lag, regime_hold_ticks;
+        int enable_learning;
+        rbpf_real_t learning_shrinkage;
+        int learning_warmup;
+    } RBPF_PipelineConfig;
+
+    /* Opaque pipeline handle */
+    typedef struct RBPF_Pipeline RBPF_Pipeline;
+
+    /* Lifecycle */
+    RBPF_PipelineConfig rbpf_pipeline_default_config(void);
+    RBPF_Pipeline *rbpf_pipeline_create(const RBPF_PipelineConfig *config);
+    void rbpf_pipeline_destroy(RBPF_Pipeline *pipe);
+    void rbpf_pipeline_init(RBPF_Pipeline *pipe, rbpf_real_t initial_vol);
+
+    /* Main API */
+    void rbpf_pipeline_step(RBPF_Pipeline *pipe, rbpf_real_t ssa_return, RBPF_Signal *sig);
+    void rbpf_pipeline_step_apf(RBPF_Pipeline *pipe, rbpf_real_t ssa_current,
+                                rbpf_real_t ssa_next, RBPF_Signal *sig);
+
+    /* Accessors */
+    int rbpf_pipeline_get_tick(const RBPF_Pipeline *pipe);
+    int rbpf_pipeline_get_regime(const RBPF_Pipeline *pipe);
+    rbpf_real_t rbpf_pipeline_get_baseline_vol(const RBPF_Pipeline *pipe);
+    void rbpf_pipeline_set_baseline_vol(RBPF_Pipeline *pipe, rbpf_real_t vol);
+    void rbpf_pipeline_get_learned_params(const RBPF_Pipeline *pipe, int regime,
+                                          rbpf_real_t *mu_vol, rbpf_real_t *sigma_vol);
+
+    /* Runtime tuning */
+    void rbpf_pipeline_set_thresholds(RBPF_Pipeline *pipe,
+                                      rbpf_real_t surprise_minor, rbpf_real_t surprise_major,
+                                      rbpf_real_t vol_ratio_minor, rbpf_real_t vol_ratio_major);
+    void rbpf_pipeline_set_scaling(RBPF_Pipeline *pipe,
+                                   rbpf_real_t scale_minor, rbpf_real_t scale_major,
+                                   rbpf_real_t scale_low_conf, rbpf_real_t conf_threshold);
+
+    /* Debug */
+    void rbpf_pipeline_print_config(const RBPF_Pipeline *pipe);
+    void rbpf_pipeline_print_signal(const RBPF_Signal *sig);
+
 #ifdef __cplusplus
 }
 #endif

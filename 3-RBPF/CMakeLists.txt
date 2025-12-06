@@ -25,6 +25,7 @@ option(RBPF_USE_DOUBLE "Use double precision (default OFF for latency)" OFF)
 add_library(rbpf_ksc STATIC
     rbpf_ksc.c
     rbpf_apf.c
+    rbpf_pipeline.c
 )
 
 target_include_directories(rbpf_ksc PUBLIC
