@@ -16,7 +16,7 @@
 #───────────────────────────────────────────────────────────────────────────────
 
 option(RBPF_BUILD_BENCH "Build RBPF benchmark executable" ON)
-option(RBPF_USE_FLOAT "Use single precision (default ON for latency)" ON)
+option(RBPF_USE_DOUBLE "Use double precision (default OFF for latency)" OFF)
 
 #───────────────────────────────────────────────────────────────────────────────
 # Static Library
@@ -40,8 +40,8 @@ if(DEFINED COMMON_DEFS)
     target_compile_definitions(rbpf_ksc PRIVATE ${COMMON_DEFS})
 endif()
 
-if(RBPF_USE_FLOAT)
-    target_compile_definitions(rbpf_ksc PUBLIC RBPF_USE_FLOAT)
+if(RBPF_USE_DOUBLE)
+    target_compile_definitions(rbpf_ksc PUBLIC RBPF_USE_DOUBLE)
 endif()
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -66,8 +66,8 @@ if(DEFINED COMMON_DEFS)
     target_compile_definitions(rbpf_ksc_shared PRIVATE ${COMMON_DEFS})
 endif()
 
-if(RBPF_USE_FLOAT)
-    target_compile_definitions(rbpf_ksc_shared PUBLIC RBPF_USE_FLOAT)
+if(RBPF_USE_DOUBLE)
+    target_compile_definitions(rbpf_ksc_shared PUBLIC RBPF_USE_DOUBLE)
 endif()
 
 set_target_properties(rbpf_ksc_shared PROPERTIES
@@ -133,6 +133,6 @@ install(FILES rbpf_ksc.h
 
 message(STATUS "")
 message(STATUS "=== RBPF-KSC Configuration ===")
-message(STATUS "Float precision:  ${RBPF_USE_FLOAT}")
+message(STATUS "Precision:        ${RBPF_USE_DOUBLE} (OFF=float, ON=double)")
 message(STATUS "Build benchmark:  ${RBPF_BUILD_BENCH}")
 message(STATUS "")

@@ -54,21 +54,21 @@ static inline double get_time_us(void)
 
 typedef struct
 {
-    float *returns;      /* Simulated returns */
-    float *true_vol;     /* True volatility (for accuracy measurement) */
-    float *true_log_vol; /* True log-volatility */
-    int *true_regime;    /* True regime at each timestep */
-    int n;               /* Number of observations */
+    rbpf_real_t *returns;      /* Simulated returns */
+    rbpf_real_t *true_vol;     /* True volatility (for accuracy measurement) */
+    rbpf_real_t *true_log_vol; /* True log-volatility */
+    int *true_regime;          /* True regime at each timestep */
+    int n;                     /* Number of observations */
 } SyntheticData;
 
-static float randn(void)
+static rbpf_real_t randn(void)
 {
     /* Box-Muller */
-    float u1 = (float)rand() / RAND_MAX;
-    float u2 = (float)rand() / RAND_MAX;
+    rbpf_real_t u1 = (rbpf_real_t)rand() / RAND_MAX;
+    rbpf_real_t u2 = (rbpf_real_t)rand() / RAND_MAX;
     if (u1 < 1e-10f)
         u1 = 1e-10f;
-    return sqrtf(-2.0f * logf(u1)) * cosf(6.283185f * u2);
+    return rbpf_sqrt(RBPF_REAL(-2.0) * rbpf_log(u1)) * rbpf_cos(RBPF_REAL(6.283185) * u2);
 }
 
 SyntheticData *generate_synthetic_data(int n, int seed)
@@ -77,24 +77,33 @@ SyntheticData *generate_synthetic_data(int n, int seed)
 
     SyntheticData *data = (SyntheticData *)malloc(sizeof(SyntheticData));
     data->n = n;
-    data->returns = (float *)malloc(n * sizeof(float));
-    data->true_vol = (float *)malloc(n * sizeof(float));
-    data->true_log_vol = (float *)malloc(n * sizeof(float));
+    data->returns = (rbpf_real_t *)malloc(n * sizeof(rbpf_real_t));
+    data->true_vol = (rbpf_real_t *)malloc(n * sizeof(rbpf_real_t));
+    data->true_log_vol = (rbpf_real_t *)malloc(n * sizeof(rbpf_real_t));
     data->true_regime = (int *)malloc(n * sizeof(int));
 
     /* Regime parameters (matching RBPF setup) */
-    /* Regime 0: Low vol, stable */
-    /* Regime 1: Medium vol */
-    /* Regime 2: High vol (crisis) */
-    /* Regime 3: Very high vol (extreme) */
+    /* Regime 0: Low vol, stable (~1% daily) */
+    /* Regime 1: Medium vol (~3% daily) */
+    /* Regime 2: High vol (~8% daily) */
+    /* Regime 3: Crisis vol (~20% daily) - must cover peaks! */
 
-    float theta[4] = {0.05f, 0.08f, 0.15f, 0.20f};
-    float mu_vol[4] = {logf(0.01f), logf(0.02f), logf(0.05f), logf(0.10f)};
-    float sigma_vol[4] = {0.05f, 0.10f, 0.20f, 0.30f};
+    /* NOTE: With sigma_vol noise, the OU process can push log-vol
+     * significantly beyond mu_vol. To avoid bias, regime 3's mu_vol
+     * should be high enough to "explain" the peak observations. */
+
+    rbpf_real_t theta[4] = {RBPF_REAL(0.05), RBPF_REAL(0.08), RBPF_REAL(0.12), RBPF_REAL(0.15)};
+    rbpf_real_t mu_vol[4] = {
+        rbpf_log(RBPF_REAL(0.01)), /* -4.6: ~1% vol */
+        rbpf_log(RBPF_REAL(0.03)), /* -3.5: ~3% vol */
+        rbpf_log(RBPF_REAL(0.08)), /* -2.5: ~8% vol */
+        rbpf_log(RBPF_REAL(0.20))  /* -1.6: ~20% vol - covers peaks */
+    };
+    rbpf_real_t sigma_vol[4] = {RBPF_REAL(0.05), RBPF_REAL(0.10), RBPF_REAL(0.20), RBPF_REAL(0.30)};
 
     /* Regime schedule: create interesting volatility patterns */
     int regime = 0;
-    float log_vol = mu_vol[0];
+    rbpf_real_t log_vol = mu_vol[0];
 
     for (int t = 0; t < n; t++)
     {
@@ -113,15 +122,15 @@ SyntheticData *generate_synthetic_data(int n, int seed)
             regime = 0; /* 80%: back to calm */
 
         /* Evolve log-vol with OU process */
-        float th = theta[regime];
-        float mv = mu_vol[regime];
-        float sv = sigma_vol[regime];
+        rbpf_real_t th = theta[regime];
+        rbpf_real_t mv = mu_vol[regime];
+        rbpf_real_t sv = sigma_vol[regime];
 
-        log_vol = (1.0f - th) * log_vol + th * mv + sv * randn();
+        log_vol = (RBPF_REAL(1.0) - th) * log_vol + th * mv + sv * randn();
 
         /* Generate return */
-        float vol = expf(log_vol);
-        float ret = vol * randn();
+        rbpf_real_t vol = rbpf_exp(log_vol);
+        rbpf_real_t ret = vol * randn();
 
         data->returns[t] = ret;
         data->true_vol[t] = vol;
@@ -150,19 +159,19 @@ void free_synthetic_data(SyntheticData *data)
 
 typedef struct
 {
-    float mae_vol;         /* Mean Absolute Error on volatility */
-    float rmse_vol;        /* Root Mean Squared Error on volatility */
-    float mae_log_vol;     /* MAE on log-volatility */
-    float max_error_vol;   /* Maximum absolute error */
-    float correlation;     /* Correlation with true vol */
-    float tail_mae;        /* MAE when true_vol > 90th percentile */
-    float regime_accuracy; /* % correct regime detection */
+    rbpf_real_t mae_vol;         /* Mean Absolute Error on volatility */
+    rbpf_real_t rmse_vol;        /* Root Mean Squared Error on volatility */
+    rbpf_real_t mae_log_vol;     /* MAE on log-volatility */
+    rbpf_real_t max_error_vol;   /* Maximum absolute error */
+    rbpf_real_t correlation;     /* Correlation with true vol */
+    rbpf_real_t tail_mae;        /* MAE when true_vol > 90th percentile */
+    rbpf_real_t regime_accuracy; /* % correct regime detection */
 } AccuracyMetrics;
 
-static int compare_float(const void *a, const void *b)
+static int compare_real(const void *a, const void *b)
 {
-    float fa = *(const float *)a;
-    float fb = *(const float *)b;
+    rbpf_real_t fa = *(const rbpf_real_t *)a;
+    rbpf_real_t fb = *(const rbpf_real_t *)b;
     return (fa > fb) - (fa < fb);
 }
 
@@ -173,41 +182,41 @@ static int compare_double(const void *a, const void *b)
     return (da > db) - (da < db);
 }
 
-AccuracyMetrics compute_accuracy(const float *est_vol, const float *est_log_vol,
+AccuracyMetrics compute_accuracy(const rbpf_real_t *est_vol, const rbpf_real_t *est_log_vol,
                                  const int *est_regime, const SyntheticData *data)
 {
     AccuracyMetrics m = {0};
     int n = data->n;
 
     /* Basic stats */
-    float sum_ae = 0, sum_se = 0, sum_ae_lv = 0;
-    float max_err = 0;
+    rbpf_real_t sum_ae = 0, sum_se = 0, sum_ae_lv = 0;
+    rbpf_real_t max_err = 0;
     int regime_correct = 0;
 
     /* For correlation */
-    float sum_true = 0, sum_est = 0;
-    float sum_true2 = 0, sum_est2 = 0, sum_te = 0;
+    rbpf_real_t sum_true = 0, sum_est = 0;
+    rbpf_real_t sum_true2 = 0, sum_est2 = 0, sum_te = 0;
 
     /* Find 90th percentile of true vol for tail analysis */
-    float *sorted_vol = (float *)malloc(n * sizeof(float));
-    memcpy(sorted_vol, data->true_vol, n * sizeof(float));
-    qsort(sorted_vol, n, sizeof(float), compare_float);
-    float p90_vol = sorted_vol[(int)(0.9f * n)];
+    rbpf_real_t *sorted_vol = (rbpf_real_t *)malloc(n * sizeof(rbpf_real_t));
+    memcpy(sorted_vol, data->true_vol, n * sizeof(rbpf_real_t));
+    qsort(sorted_vol, n, sizeof(rbpf_real_t), compare_real);
+    rbpf_real_t p90_vol = sorted_vol[(int)(RBPF_REAL(0.9) * n)];
     free(sorted_vol);
 
     int tail_count = 0;
-    float tail_sum_ae = 0;
+    rbpf_real_t tail_sum_ae = 0;
 
     for (int t = 0; t < n; t++)
     {
-        float true_v = data->true_vol[t];
-        float est_v = est_vol[t];
-        float true_lv = data->true_log_vol[t];
-        float est_lv = est_log_vol[t];
+        rbpf_real_t true_v = data->true_vol[t];
+        rbpf_real_t est_v = est_vol[t];
+        rbpf_real_t true_lv = data->true_log_vol[t];
+        rbpf_real_t est_lv = est_log_vol[t];
 
-        float ae = fabsf(true_v - est_v);
-        float se = (true_v - est_v) * (true_v - est_v);
-        float ae_lv = fabsf(true_lv - est_lv);
+        rbpf_real_t ae = rbpf_fabs(true_v - est_v);
+        rbpf_real_t se = (true_v - est_v) * (true_v - est_v);
+        rbpf_real_t ae_lv = rbpf_fabs(true_lv - est_lv);
 
         sum_ae += ae;
         sum_se += se;
@@ -233,18 +242,18 @@ AccuracyMetrics compute_accuracy(const float *est_vol, const float *est_log_vol,
     }
 
     m.mae_vol = sum_ae / n;
-    m.rmse_vol = sqrtf(sum_se / n);
+    m.rmse_vol = rbpf_sqrt(sum_se / n);
     m.mae_log_vol = sum_ae_lv / n;
     m.max_error_vol = max_err;
-    m.regime_accuracy = (float)regime_correct / n * 100.0f;
+    m.regime_accuracy = (rbpf_real_t)regime_correct / n * RBPF_REAL(100.0);
     m.tail_mae = (tail_count > 0) ? tail_sum_ae / tail_count : 0;
 
     /* Pearson correlation */
-    float n_f = (float)n;
-    float cov = sum_te - sum_true * sum_est / n_f;
-    float var_true = sum_true2 - sum_true * sum_true / n_f;
-    float var_est = sum_est2 - sum_est * sum_est / n_f;
-    m.correlation = cov / (sqrtf(var_true * var_est) + 1e-10f);
+    rbpf_real_t n_f = (rbpf_real_t)n;
+    rbpf_real_t cov = sum_te - sum_true * sum_est / n_f;
+    rbpf_real_t var_true = sum_true2 - sum_true * sum_true / n_f;
+    rbpf_real_t var_est = sum_est2 - sum_est * sum_est / n_f;
+    m.correlation = cov / (rbpf_sqrt(var_true * var_est) + 1e-10f);
 
     return m;
 }
@@ -280,33 +289,44 @@ BenchmarkResult run_benchmark(int n_particles, const SyntheticData *data,
     }
 
     /* Configure regimes to match synthetic data */
-    rbpf_ksc_set_regime_params(rbpf, 0, 0.05f, logf(0.01f), 0.05f);
-    rbpf_ksc_set_regime_params(rbpf, 1, 0.08f, logf(0.02f), 0.10f);
-    rbpf_ksc_set_regime_params(rbpf, 2, 0.15f, logf(0.05f), 0.20f);
-    rbpf_ksc_set_regime_params(rbpf, 3, 0.20f, logf(0.10f), 0.30f);
+    /* Regime params - MUST match synthetic data range! */
+    rbpf_ksc_set_regime_params(rbpf, 0, 0.05f, rbpf_log(0.01f), 0.05f); /* -4.6: calm */
+    rbpf_ksc_set_regime_params(rbpf, 1, 0.08f, rbpf_log(0.03f), 0.10f); /* -3.5: medium */
+    rbpf_ksc_set_regime_params(rbpf, 2, 0.12f, rbpf_log(0.08f), 0.20f); /* -2.5: high */
+    rbpf_ksc_set_regime_params(rbpf, 3, 0.15f, rbpf_log(0.20f), 0.30f); /* -1.6: crisis */
 
-    /* Build transition matrix (sticky regimes) */
-    float trans[16] = {
-        0.95f, 0.03f, 0.015f, 0.005f, /* From regime 0 */
-        0.05f, 0.90f, 0.04f, 0.01f,   /* From regime 1 */
-        0.02f, 0.08f, 0.85f, 0.05f,   /* From regime 2 */
-        0.01f, 0.04f, 0.10f, 0.85f    /* From regime 3 */
+    /* Build transition matrix
+     *
+     * CRITICAL: Transitions must be "loose" enough to allow quick regime changes!
+     * Too sticky (0.95 stay prob) → particles get stuck, can't respond to jumps
+     * Too loose (0.50 stay prob) → noisy regime estimates
+     *
+     * Rule of thumb: stay_prob ≈ 0.8-0.9 for HFT with regime changes every 100+ ticks
+     */
+    rbpf_real_t trans[16] = {
+        0.85f, 0.08f, 0.05f, 0.02f, /* From regime 0: easier to escape */
+        0.08f, 0.80f, 0.08f, 0.04f, /* From regime 1 */
+        0.04f, 0.08f, 0.80f, 0.08f, /* From regime 2 */
+        0.02f, 0.05f, 0.08f, 0.85f  /* From regime 3 */
     };
     rbpf_ksc_build_transition_lut(rbpf, trans);
 
     /* Regularization */
     rbpf_ksc_set_regularization(rbpf, 0.02f, 0.001f);
 
+    /* Enable regime diversity to prevent particle collapse */
+    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 20, 0.03f); /* 5% min, 3% mutation */
+
     /* Allocate output storage */
-    float *est_vol = (float *)malloc(n_obs * sizeof(float));
-    float *est_log_vol = (float *)malloc(n_obs * sizeof(float));
+    rbpf_real_t *est_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    rbpf_real_t *est_log_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     int *est_regime = (int *)malloc(n_obs * sizeof(int));
     double *latencies = (double *)malloc(n_obs * sizeof(double));
 
     /* Warmup runs */
     for (int iter = 0; iter < warmup_iters; iter++)
     {
-        rbpf_ksc_init(rbpf, logf(0.01f), 0.1f);
+        rbpf_ksc_init(rbpf, rbpf_log(0.01f), 0.1f);
         rbpf_ksc_warmup(rbpf);
 
         RBPF_KSC_Output out;
@@ -321,7 +341,7 @@ BenchmarkResult run_benchmark(int n_particles, const SyntheticData *data,
 
     for (int iter = 0; iter < measure_iters; iter++)
     {
-        rbpf_ksc_init(rbpf, logf(0.01f), 0.1f);
+        rbpf_ksc_init(rbpf, rbpf_log(0.01f), 0.1f);
 
         RBPF_KSC_Output out;
         for (int t = 0; t < n_obs; t++)
@@ -371,16 +391,16 @@ BenchmarkResult run_benchmark(int n_particles, const SyntheticData *data,
 
 typedef struct
 {
-    float *est_vol;
-    float *est_log_vol;
-    float *true_vol;
-    float *true_log_vol;
+    rbpf_real_t *est_vol;
+    rbpf_real_t *est_log_vol;
+    rbpf_real_t *true_vol;
+    rbpf_real_t *true_log_vol;
     int *est_regime;
     int *true_regime;
-    float *surprise;
-    float *regime_entropy;
-    float *vol_ratio;
-    float *ess;
+    rbpf_real_t *surprise;
+    rbpf_real_t *regime_entropy;
+    rbpf_real_t *vol_ratio;
+    rbpf_real_t *ess;
     int *regime_changed;
     int *change_type;
     int n;
@@ -392,22 +412,22 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
 
     DiagnosticData *diag = (DiagnosticData *)malloc(sizeof(DiagnosticData));
     diag->n = n_obs;
-    diag->est_vol = (float *)malloc(n_obs * sizeof(float));
-    diag->est_log_vol = (float *)malloc(n_obs * sizeof(float));
-    diag->true_vol = (float *)malloc(n_obs * sizeof(float));
-    diag->true_log_vol = (float *)malloc(n_obs * sizeof(float));
+    diag->est_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->est_log_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->true_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->true_log_vol = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->est_regime = (int *)malloc(n_obs * sizeof(int));
     diag->true_regime = (int *)malloc(n_obs * sizeof(int));
-    diag->surprise = (float *)malloc(n_obs * sizeof(float));
-    diag->regime_entropy = (float *)malloc(n_obs * sizeof(float));
-    diag->vol_ratio = (float *)malloc(n_obs * sizeof(float));
-    diag->ess = (float *)malloc(n_obs * sizeof(float));
+    diag->surprise = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->regime_entropy = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->vol_ratio = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
+    diag->ess = (rbpf_real_t *)malloc(n_obs * sizeof(rbpf_real_t));
     diag->regime_changed = (int *)malloc(n_obs * sizeof(int));
     diag->change_type = (int *)malloc(n_obs * sizeof(int));
 
     /* Copy true values */
-    memcpy(diag->true_vol, data->true_vol, n_obs * sizeof(float));
-    memcpy(diag->true_log_vol, data->true_log_vol, n_obs * sizeof(float));
+    memcpy(diag->true_vol, data->true_vol, n_obs * sizeof(rbpf_real_t));
+    memcpy(diag->true_log_vol, data->true_log_vol, n_obs * sizeof(rbpf_real_t));
     memcpy(diag->true_regime, data->true_regime, n_obs * sizeof(int));
 
     /* Create and configure filter */
@@ -415,19 +435,23 @@ DiagnosticData *run_diagnostic(int n_particles, const SyntheticData *data)
     if (!rbpf)
         return diag;
 
-    rbpf_ksc_set_regime_params(rbpf, 0, 0.05f, logf(0.01f), 0.05f);
-    rbpf_ksc_set_regime_params(rbpf, 1, 0.08f, logf(0.02f), 0.10f);
-    rbpf_ksc_set_regime_params(rbpf, 2, 0.15f, logf(0.05f), 0.20f);
-    rbpf_ksc_set_regime_params(rbpf, 3, 0.20f, logf(0.10f), 0.30f);
+    /* Regime parameters must span the full volatility range in the data!
+     * If data peaks at log(0.25) ≈ -1.4, regime 3 must have μ_vol near there. */
+    rbpf_ksc_set_regime_params(rbpf, 0, 0.05f, rbpf_log(0.01f), 0.05f); /* -4.6: calm */
+    rbpf_ksc_set_regime_params(rbpf, 1, 0.08f, rbpf_log(0.03f), 0.10f); /* -3.5: medium */
+    rbpf_ksc_set_regime_params(rbpf, 2, 0.12f, rbpf_log(0.08f), 0.20f); /* -2.5: high */
+    rbpf_ksc_set_regime_params(rbpf, 3, 0.15f, rbpf_log(0.20f), 0.30f); /* -1.6: crisis */
 
-    float trans[16] = {
-        0.95f, 0.03f, 0.015f, 0.005f,
-        0.05f, 0.90f, 0.04f, 0.01f,
-        0.02f, 0.08f, 0.85f, 0.05f,
-        0.01f, 0.04f, 0.10f, 0.85f};
+    rbpf_real_t trans[16] = {
+        0.85f, 0.08f, 0.05f, 0.02f, /* From regime 0 */
+        0.08f, 0.80f, 0.08f, 0.04f, /* From regime 1 */
+        0.04f, 0.08f, 0.80f, 0.08f, /* From regime 2 */
+        0.02f, 0.05f, 0.08f, 0.85f  /* From regime 3 */
+    };
     rbpf_ksc_build_transition_lut(rbpf, trans);
     rbpf_ksc_set_regularization(rbpf, 0.02f, 0.001f);
-    rbpf_ksc_init(rbpf, logf(0.01f), 0.1f);
+    rbpf_ksc_set_regime_diversity(rbpf, n_particles / 20, 0.03f);
+    rbpf_ksc_init(rbpf, rbpf_log(0.01f), 0.1f);
 
     /* Run filter and collect diagnostics */
     RBPF_KSC_Output out;
@@ -517,8 +541,8 @@ void print_changepoint_analysis(const DiagnosticData *diag, const SyntheticData 
         {
             /* True changepoint - show window around it */
             int detected_nearby = 0;
-            float max_surprise = 0;
-            float max_entropy = 0;
+            rbpf_real_t max_surprise = 0;
+            rbpf_real_t max_entropy = 0;
 
             /* Look in window [t-5, t+10] for detection */
             for (int w = (t > 5 ? t - 5 : 0); w < (t + 10 < n ? t + 10 : n); w++)
@@ -580,7 +604,7 @@ void print_tracking_summary(const DiagnosticData *diag)
     printf("\n=== Tracking Quality by Regime ===\n\n");
 
     int n = diag->n;
-    float mae_by_regime[4] = {0};
+    rbpf_real_t mae_by_regime[4] = {0};
     int count_by_regime[4] = {0};
 
     for (int t = 0; t < n; t++)
@@ -588,7 +612,7 @@ void print_tracking_summary(const DiagnosticData *diag)
         int r = diag->true_regime[t];
         if (r >= 0 && r < 4)
         {
-            mae_by_regime[r] += fabsf(diag->true_log_vol[t] - diag->est_log_vol[t]);
+            mae_by_regime[r] += rbpf_fabs(diag->true_log_vol[t] - diag->est_log_vol[t]);
             count_by_regime[r]++;
         }
     }
@@ -596,7 +620,7 @@ void print_tracking_summary(const DiagnosticData *diag)
     printf("%-10s %-10s %-12s %-12s\n", "Regime", "Count", "MAE(log-vol)", "Typical Vol");
     printf("────────────────────────────────────────────────\n");
 
-    float typical_vol[4] = {0.01f, 0.02f, 0.05f, 0.10f};
+    rbpf_real_t typical_vol[4] = {RBPF_REAL(0.01), RBPF_REAL(0.03), RBPF_REAL(0.08), RBPF_REAL(0.20)};
     for (int r = 0; r < 4; r++)
     {
         if (count_by_regime[r] > 0)
@@ -610,7 +634,7 @@ void print_tracking_summary(const DiagnosticData *diag)
     /* Surprise statistics */
     printf("\n=== Surprise Statistics ===\n\n");
 
-    float surprise_sum = 0, surprise_max = 0;
+    rbpf_real_t surprise_sum = 0, surprise_max = 0;
     for (int t = 0; t < n; t++)
     {
         surprise_sum += diag->surprise[t];
@@ -622,7 +646,7 @@ void print_tracking_summary(const DiagnosticData *diag)
     printf("Max surprise:  %.2f\n", surprise_max);
 
     /* ESS statistics */
-    float ess_sum = 0, ess_min = diag->ess[0];
+    rbpf_real_t ess_sum = 0, ess_min = diag->ess[0];
     for (int t = 0; t < n; t++)
     {
         ess_sum += diag->ess[t];
@@ -657,7 +681,7 @@ int main(int argc, char **argv)
     SyntheticData *data = generate_synthetic_data(n_obs, seed);
 
     /* Print data summary */
-    float min_vol = data->true_vol[0], max_vol = data->true_vol[0];
+    rbpf_real_t min_vol = data->true_vol[0], max_vol = data->true_vol[0];
     for (int t = 1; t < n_obs; t++)
     {
         if (data->true_vol[t] < min_vol)
@@ -709,11 +733,11 @@ int main(int argc, char **argv)
 
     /* Budget check */
     printf("\n=== Latency Budget Check (200μs total) ===\n");
-    float ssa_us = 140.0f;
-    float rbpf_us = (float)detailed.latency_mean_us;
-    float kelly_us = 0.5f;
-    float total_us = ssa_us + rbpf_us + kelly_us;
-    float headroom = 200.0f - total_us;
+    rbpf_real_t ssa_us = RBPF_REAL(140.0);
+    rbpf_real_t rbpf_us = (rbpf_real_t)detailed.latency_mean_us;
+    rbpf_real_t kelly_us = RBPF_REAL(0.5);
+    rbpf_real_t total_us = ssa_us + rbpf_us + kelly_us;
+    rbpf_real_t headroom = RBPF_REAL(200.0) - total_us;
 
     printf("  SSA:      %.1f μs\n", ssa_us);
     printf("  RBPF:     %.1f μs (measured)\n", rbpf_us);
@@ -737,7 +761,164 @@ int main(int argc, char **argv)
     /* Export CSV for plotting */
     export_diagnostic_csv(diag, "rbpf_diagnostic.csv");
 
+    printf("\n=== Plotting Commands ===\n");
+    printf("Python:\n");
+    printf("  import pandas as pd\n");
+    printf("  import matplotlib.pyplot as plt\n");
+    printf("  df = pd.read_csv('rbpf_diagnostic.csv')\n");
+    printf("  \n");
+    printf("  fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)\n");
+    printf("  \n");
+    printf("  # Log-vol tracking\n");
+    printf("  axes[0].plot(df['t'], df['true_log_vol'], 'b-', alpha=0.7, label='True')\n");
+    printf("  axes[0].plot(df['t'], df['est_log_vol'], 'r-', alpha=0.7, label='Estimate')\n");
+    printf("  axes[0].set_ylabel('Log-Vol')\n");
+    printf("  axes[0].legend()\n");
+    printf("  \n");
+    printf("  # Regime\n");
+    printf("  axes[1].plot(df['t'], df['true_regime'], 'b-', label='True')\n");
+    printf("  axes[1].plot(df['t'], df['est_regime'], 'r--', alpha=0.7, label='Estimate')\n");
+    printf("  axes[1].set_ylabel('Regime')\n");
+    printf("  axes[1].legend()\n");
+    printf("  \n");
+    printf("  # Surprise\n");
+    printf("  axes[2].plot(df['t'], df['surprise'], 'g-')\n");
+    printf("  axes[2].axhline(y=5, color='r', linestyle='--', alpha=0.5)\n");
+    printf("  axes[2].set_ylabel('Surprise')\n");
+    printf("  \n");
+    printf("  # ESS\n");
+    printf("  axes[3].plot(df['t'], df['ess'], 'purple')\n");
+    printf("  axes[3].axhline(y=100, color='r', linestyle='--', alpha=0.5)\n");
+    printf("  axes[3].set_ylabel('ESS')\n");
+    printf("  axes[3].set_xlabel('Time')\n");
+    printf("  \n");
+    printf("  plt.tight_layout()\n");
+    printf("  plt.savefig('rbpf_diagnostic.png', dpi=150)\n");
+    printf("  plt.show()\n");
+
     free_diagnostic(diag);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * LIU-WEST PARAMETER LEARNING TEST
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n");
+    printf("════════════════════════════════════════════════════════════════════════════\n");
+    printf("                    LIU-WEST PARAMETER LEARNING TEST\n");
+    printf("════════════════════════════════════════════════════════════════════════════\n\n");
+
+    /* Create filter with wrong initial parameters */
+    RBPF_KSC *rbpf_lw = rbpf_ksc_create(200, 4);
+    if (rbpf_lw)
+    {
+        /* Set WRONG initial parameters (deliberately off) */
+        printf("Initial (wrong) parameters:\n");
+        printf("  Regime 0: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.005f), rbpf_log(0.01f));
+        printf("  Regime 1: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.010f), rbpf_log(0.02f));
+        printf("  Regime 2: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.025f), rbpf_log(0.05f));
+        printf("  Regime 3: μ_vol = %.4f (true: %.4f)\n", rbpf_log(0.050f), rbpf_log(0.10f));
+
+        rbpf_ksc_set_regime_params(rbpf_lw, 0, 0.05f, rbpf_log(0.005f), 0.05f); /* Wrong! */
+        rbpf_ksc_set_regime_params(rbpf_lw, 1, 0.08f, rbpf_log(0.010f), 0.10f); /* Wrong! */
+        rbpf_ksc_set_regime_params(rbpf_lw, 2, 0.15f, rbpf_log(0.025f), 0.20f); /* Wrong! */
+        rbpf_ksc_set_regime_params(rbpf_lw, 3, 0.20f, rbpf_log(0.050f), 0.30f); /* Wrong! */
+
+        rbpf_real_t trans[16] = {
+            0.85f, 0.08f, 0.05f, 0.02f,
+            0.08f, 0.80f, 0.08f, 0.04f,
+            0.04f, 0.08f, 0.80f, 0.08f,
+            0.02f, 0.05f, 0.08f, 0.85f};
+        rbpf_ksc_build_transition_lut(rbpf_lw, trans);
+        rbpf_ksc_set_regularization(rbpf_lw, 0.02f, 0.001f);
+        rbpf_ksc_set_regime_diversity(rbpf_lw, 25, 0.03f); /* 25 min per regime, 3% mutation */
+
+        /* Enable Liu-West learning with AGGRESSIVE settings
+         *
+         * Key insight: Liu-West only learns during resample!
+         * - Shrinkage 0.90: Fast adaptation (was 0.98, way too slow)
+         * - Warmup 20: Start learning quickly
+         * - ESS threshold 0.90: Resample frequently
+         * - Force resample every 3 ticks: Guarantee learning happens
+         */
+        rbpf_ksc_enable_liu_west(rbpf_lw, 0.90f, 20);      /* a=0.90 (very fast), warmup=20 */
+        rbpf_ksc_set_liu_west_resample(rbpf_lw, 0.90f, 3); /* ESS<90%, force every 3 ticks */
+        rbpf_ksc_set_liu_west_bounds(rbpf_lw,
+                                     rbpf_log(0.001f), rbpf_log(RBPF_REAL(0.5)), /* μ_vol bounds */
+                                     RBPF_REAL(0.01), RBPF_REAL(1.0));           /* σ_vol bounds */
+
+        rbpf_ksc_init(rbpf_lw, rbpf_log(0.01f), 0.1f);
+
+        /* Run filter on synthetic data */
+        RBPF_KSC_Output out;
+        int n_obs = data->n;
+
+        /* Track learned params over time */
+        rbpf_real_t learned_mu_vol[4][5]; /* 4 regimes × 5 checkpoints */
+        int checkpoints[] = {100, 500, 1000, 2500, 5000};
+        int cp_idx = 0;
+
+        for (int t = 0; t < n_obs; t++)
+        {
+            rbpf_ksc_step(rbpf_lw, data->returns[t], &out);
+
+            /* Record at checkpoints */
+            if (cp_idx < 5 && t == checkpoints[cp_idx] - 1)
+            {
+                for (int r = 0; r < 4; r++)
+                {
+                    learned_mu_vol[r][cp_idx] = out.learned_mu_vol[r];
+                }
+                cp_idx++;
+            }
+        }
+
+        /* Report learning progress */
+        printf("\nLearned μ_vol over time:\n");
+        printf("%-8s", "Regime");
+        for (int c = 0; c < 5; c++)
+        {
+            printf("  t=%-5d", checkpoints[c]);
+        }
+        printf("  True\n");
+        printf("────────────────────────────────────────────────────────────────\n");
+
+        rbpf_real_t true_mu_vol[4] = {
+            rbpf_log(RBPF_REAL(0.01)), /* -4.6 */
+            rbpf_log(RBPF_REAL(0.03)), /* -3.5 */
+            rbpf_log(RBPF_REAL(0.08)), /* -2.5 */
+            rbpf_log(RBPF_REAL(0.20))  /* -1.6 */
+        };
+        for (int r = 0; r < 4; r++)
+        {
+            printf("%-8d", r);
+            for (int c = 0; c < 5; c++)
+            {
+                printf("  %7.3f", learned_mu_vol[r][c]);
+            }
+            printf("  %7.3f\n", true_mu_vol[r]);
+        }
+
+        /* Compute final error */
+        printf("\nFinal learning error (|learned - true|):\n");
+        rbpf_real_t total_error = 0;
+        for (int r = 0; r < 4; r++)
+        {
+            rbpf_real_t error = rbpf_fabs(learned_mu_vol[r][4] - true_mu_vol[r]);
+            total_error += error;
+            printf("  Regime %d: %.4f\n", r, error);
+        }
+        printf("  Total:    %.4f\n", total_error);
+
+        if (total_error < RBPF_REAL(1.0))
+        {
+            printf("\n✓ Liu-West learning PASSED (error < 1.0)\n");
+        }
+        else
+        {
+            printf("\n✗ Liu-West learning needs tuning (error = %.2f)\n", total_error);
+        }
+
+        rbpf_ksc_destroy(rbpf_lw);
+    }
 
     /* Cleanup */
     free_synthetic_data(data);
